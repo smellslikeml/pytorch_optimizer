@@ -148,6 +148,7 @@ from pytorch_optimizer.optimizer import (
     LookSAM,
     Magma,
     Muon,
+    NorMuon,
     NAdam,
     Nero,
     NovoGrad,
