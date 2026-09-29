@@ -25,9 +25,10 @@ name: Outrider
 # refiner dispatches its promotions).
 
 on:
-  schedule:
-    # Daily at 14:00 UTC
-    - cron: '0 14 * * *'
+  # schedule:
+  #   # Daily at 14:00 UTC
+  #   - cron: '0 14 * * *'
+  # Disabled: this fork runs on targeted `remyxai outrider trigger` dispatches only.
   workflow_dispatch:
     inputs:
       agent:
@@ -43,7 +44,7 @@ on:
         description: 'Which model backend to route the agent at. The action picks the matching secret, endpoint and auth style from its own registry.'
         type: choice
         required: false
-        default: 'anthropic'
+        default: 'zai'
         options:
           - anthropic
           - custom
