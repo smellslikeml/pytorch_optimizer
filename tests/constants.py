@@ -108,6 +108,7 @@ from pytorch_optimizer.optimizer import (
     Shampoo,
     SignSGD,
     SimplifiedAdEMAMix,
+    SoftSignum,
     SophiaH,
     SpectralSphere,
     SPlus,
@@ -959,6 +960,9 @@ OPTIMIZERS: List[Tuple[Any, Dict[str, Any], int]] = [
     (DualAdam, {'lr': 1e0, 'weight_decay': 1e-3, 'weight_decouple': True, 'switch_rate': 0.5}, 5),
     (LoRARite, {'lr': 5e-1, 'weight_decay': 1e-3, 'weight_decouple': True, 'update_capping': 0.1}, 5),
     (FlashAdamW, {'lr': 5e-1, 'weight_decay': 1e-3, 'check_numerics': True, 'master_weight_bits': None}, 5),
+    (SoftSignum, {'lr': 1e0, 'weight_decay': 1e-3, 'sign_iters': 2, 'transition_iters': 10}, 5),
+    (SoftSignum, {'lr': 1e0, 'momentum': 0.9, 'nesterov': True, 'sign_iters': 1, 'transition_iters': 10}, 5),
+    (SoftSignum, {'lr': 5e-1, 'sign_norm': True, 'sign_iters': 2, 'transition_iters': 10}, 5),
 ]
 
 ADANORM_SUPPORTED_OPTIMIZERS: List[Tuple[Any, Dict[str, Union[float, bool, int]], int]] = [

@@ -508,6 +508,10 @@
     :docstring:
     :members:
 
+::: pytorch_optimizer.SoftSignum
+    :docstring:
+    :members:
+
 ::: pytorch_optimizer.SophiaH
     :docstring:
     :members:
