@@ -105,6 +105,7 @@ from pytorch_optimizer.optimizer.shampoo import ScalableShampoo, Shampoo
 from pytorch_optimizer.optimizer.sm3 import SM3
 from pytorch_optimizer.optimizer.snsm import AdamWSN
 from pytorch_optimizer.optimizer.soap import SOAP
+from pytorch_optimizer.optimizer.softsignum import SoftSignum
 from pytorch_optimizer.optimizer.sophia import SophiaH
 from pytorch_optimizer.optimizer.spam import SPAM, StableSPAM
 from pytorch_optimizer.optimizer.splus import SPlus
@@ -239,6 +240,7 @@ OPTIMIZER_LIST: List[OptimizerType] = [
     SignSGD,
     SimplifiedAdEMAMix,
     SophiaH,
+    SoftSignum,
     StableAdamW,
     StableSPAM,
     TAM,
