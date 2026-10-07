@@ -508,6 +508,10 @@
     :docstring:
     :members:
 
+::: pytorch_optimizer.SoftServe
+    :docstring:
+    :members:
+
 ::: pytorch_optimizer.SophiaH
     :docstring:
     :members:

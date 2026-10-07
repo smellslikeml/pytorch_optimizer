@@ -108,6 +108,7 @@ from pytorch_optimizer.optimizer import (
     Shampoo,
     SignSGD,
     SimplifiedAdEMAMix,
+    SoftServe,
     SophiaH,
     SpectralSphere,
     SPlus,
@@ -321,6 +322,7 @@ SKIP_EPSILON: frozenset = frozenset(
         'ftrl',
         'demo',
         'muon',
+        'softserve',
         'focus',
         'kron',
         'sgd',
@@ -378,6 +380,7 @@ SKIP_CREATE_OPTIMIZER: frozenset = frozenset(
         'adagrad',
         'demo',
         'distributedmuon',
+        'softserve',
     }
 )
 
@@ -422,7 +425,7 @@ SKIP_COMPLEX_NOT_SUPPORTED: frozenset = frozenset(
     }
 )
 
-SKIP_BF16_OPTIMIZERS: frozenset = frozenset({'adai', 'prodigy', 'nero', 'lorarite'})
+SKIP_BF16_OPTIMIZERS: frozenset = frozenset({'adai', 'prodigy', 'nero', 'lorarite', 'softserve'})
 
 CAWR_RECIPES: Tuple[Tuple, ...] = (
     (
@@ -885,6 +888,8 @@ OPTIMIZERS: List[Tuple[Any, Dict[str, Any], int]] = [
     (AdaMuon, {'lr': 5e-1, 'weight_decay': 1e-3, 'adamw_lr': 5e-1, 'adamw_wd': 1e-2}, 5),
     (AdaMuon, {'lr': 5e-1, 'weight_decay': 1e-3, 'use_adjusted_lr': True, 'adamw_lr': 5e-1, 'adamw_wd': 1e-2}, 5),
     (AdaGO, {'lr': 5e-1, 'adamw_lr': 5e-1, 'adamw_wd': 1e-2, 'nesterov': True}, 5),
+    (SoftServe, {'lr': 5e-1, 'k': 2, 'fallback_lr': 5e-1, 'fallback_weight_decay': 1e-2}, 5),
+    (SoftServe, {'lr': 5e-1, 'k': 2, 'nesterov': True, 'weight_decay': 1e-3, 'fallback_lr': 5e-1}, 5),
     (LaProp, {'lr': 1e0, 'weight_decay': 1e-3}, 5),
     (LaProp, {'lr': 1e0, 'centered': True, 'weight_decay': 1e-3}, 11),
     (LaProp, {'lr': 1e0, 'ams_bound': True, 'weight_decay': 1e-3}, 5),

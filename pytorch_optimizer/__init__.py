@@ -173,6 +173,7 @@ from pytorch_optimizer.optimizer import (
     Shampoo,
     SignSGD,
     SimplifiedAdEMAMix,
+    SoftServe,
     SophiaH,
     SPlus,
     StableAdamW,
