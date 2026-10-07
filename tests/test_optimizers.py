@@ -150,6 +150,8 @@ def test_init_group(optimizer_config):
 
     if optimizer_name in {'muon', 'adamuon', 'adago'}:
         optimizer_class([{'params': param, 'use_muon': True}], **common_config).init_group(group)
+    elif optimizer_name == 'softserve':
+        optimizer_class([{'params': param, 'use_kron': True}], **common_config).init_group(group)
     else:
         optimizer_class([param], **common_config).init_group({**group, 'betas': (0.0, 0.0)})
 
@@ -165,6 +167,8 @@ def test_closure(optimizer):
         optimizer = optimizer([param], num_iterations=1)
     elif optimizer_name in ('Muon', 'AdaMuon', 'AdaGO'):
         optimizer = optimizer([{'params': param, 'use_muon': False}])
+    elif optimizer_name in ('SoftServe',):
+        optimizer = optimizer([{'params': param, 'use_kron': False}])
     else:
         optimizer = optimizer([param])
 

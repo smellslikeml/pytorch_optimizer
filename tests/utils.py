@@ -145,6 +145,14 @@ def build_optimizer_parameter(parameters, optimizer_name, config):
             {'params': hidden_weights, 'use_muon': True},
             {'params': hidden_gains_biases, 'use_muon': False},
         ]
+    elif optimizer_name in ('SoftServe',):
+        matrix_weights = [p for p in parameters if p.ndim >= 2]
+        non_matrix_params = [p for p in parameters if p.ndim < 2]
+
+        parameters = [
+            {'params': matrix_weights, 'use_kron': True},
+            {'params': non_matrix_params, 'use_kron': False},
+        ]
     elif optimizer_name in ('SpectralSphere',):
         parameters = [{'params': [p for p in parameters if p.ndim >= 2]}]
     elif optimizer_name == 'AdamWSN':
@@ -180,6 +188,15 @@ class OptimizerBuilder:
 
         return [with_flag(group) for group in params] if isinstance(params, list) else [with_flag(params)]
 
+    @staticmethod
+    def with_use_kron(params, use_kron: bool):
+        def with_flag(group):
+            if isinstance(group, dict):
+                return group if 'use_kron' in group else {**group, 'use_kron': use_kron}
+            return {'params': group, 'use_kron': use_kron}
+
+        return [with_flag(group) for group in params] if isinstance(params, list) else [with_flag(params)]
+
     @classmethod
     def create(cls, name: str, params: List, **overrides):
         optimizer_name: str = name.lower()
@@ -204,6 +221,8 @@ class OptimizerBuilder:
 
         if optimizer_name in ('muon', 'adamuon', 'adago'):
             params = cls.with_muon(params, use_muon=overrides.pop('use_muon', False))
+        elif optimizer_name == 'softserve':
+            params = cls.with_use_kron(params, use_kron=overrides.pop('use_kron', False))
 
         return load_optimizer(optimizer_name)(params, **overrides)
 
