@@ -119,7 +119,12 @@ jobs:
     env:
       REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
     steps:
-      # Mint a remyx[bot] token from Remyx so the PR / Issue is authored by
+      - name: Refresh apt lists + pre-install poppler-utils
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends poppler-utils || true
+            # Mint a remyx[bot] token from Remyx so the PR / Issue is authored by
       # the Remyx GitHub App (not github-actions[bot]). The App private key
       # stays on Remyx's side; this uses the REMYX_API_KEY already in secrets.
       # If it can't be minted (e.g. App not installed), the token is empty and
