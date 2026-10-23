@@ -231,7 +231,7 @@ def test_complex_not_supported(no_complex_optimizer):
 
     param = simple_complex_parameter()
 
-    use_muon: bool = no_complex_optimizer in ('muon', 'adamuon', 'adago')
+    use_muon: bool = no_complex_optimizer in ('muon', 'adamuon', 'adago', 'normuon')
     optimizer = OptimizerBuilder.create(no_complex_optimizer, [param], use_muon=use_muon)
 
     with pytest.raises(NoComplexParameterError):

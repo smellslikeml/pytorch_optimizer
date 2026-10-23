@@ -137,7 +137,7 @@ def build_model(use_complex: bool = False):
 def build_optimizer_parameter(parameters, optimizer_name, config):
     if optimizer_name == 'AliG':
         config.update({'projection_fn': lambda: l2_projection(parameters, max_norm=1)})
-    elif optimizer_name in ('Muon', 'AdaMuon', 'AdaGO'):
+    elif optimizer_name in ('Muon', 'AdaMuon', 'AdaGO', 'NorMuon'):
         hidden_weights = [p for p in parameters if p.ndim >= 2]
         hidden_gains_biases = [p for p in parameters if p.ndim < 2]
 
@@ -202,7 +202,7 @@ class OptimizerBuilder:
         elif optimizer_name == 'adahessian':
             overrides.update({'update_period': 2})
 
-        if optimizer_name in ('muon', 'adamuon', 'adago'):
+        if optimizer_name in ('muon', 'adamuon', 'adago', 'normuon'):
             params = cls.with_muon(params, use_muon=overrides.pop('use_muon', False))
 
         return load_optimizer(optimizer_name)(params, **overrides)

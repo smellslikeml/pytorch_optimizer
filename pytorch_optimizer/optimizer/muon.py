@@ -644,6 +644,216 @@ class AdaMuon(BaseOptimizer):
         return loss
 
 
+class NorMuon(BaseOptimizer):
+    """Neuron-wise Normalized Muon optimizer.
+
+    NorMuon augments Muon with neuron-level adaptive learning rates. After the Newton-Schulz
+    orthogonalization, it maintains a per-neuron (per-row) second moment of the orthogonalized update,
+    normalizes each row by it, and then rescales the update so that its total norm is unchanged. This
+    balances neuron utilization while preserving Muon's update conditioning.
+
+    Unlike AdaMuon, which keeps an element-wise second moment over the flattened update, the second moment
+    here has one scalar per output neuron (row) and is applied after the orthogonalization.
+
+    Reference:
+        NorMuon: Making Muon more efficient and scalable (arXiv:2510.05491)
+        https://arxiv.org/abs/2510.05491
+        Ported with attribution from the MIT-licensed reference implementation:
+        https://github.com/zichongli5/NorMuon
+
+    Args:
+        params (ParamsT): The parameters to be optimized by Muon.
+        lr (float): Learning rate.
+        betas (tuple): Coefficients used for computing running averages of the momentum and the per-neuron
+            second moment of the orthogonalized update.
+        weight_decay (float): Weight decay (L2 penalty).
+        weight_decouple (bool): The optimizer uses decoupled weight decay as in AdamW.
+        nesterov (bool): Whether to use nesterov momentum.
+        ns_steps (int): The number of Newton-Schulz iterations to run. (5 is probably always enough)
+        ns_coeffs (NewtonSchulzWeights): Newton-Schulz coefficients or preset name.
+        adamw_lr (float): The learning rate for the internal AdamW.
+        adamw_betas (tuple): The betas for the internal AdamW.
+        adamw_wd (float): The weight decay for the internal AdamW.
+        eps (float): Term added to the denominator to improve numerical stability.
+        maximize (bool): Maximize the objective with respect to the params, instead of minimizing.
+
+    Example:
+        from pytorch_optimizer import NorMuon
+
+        hidden_weights = [p for p in model.body.parameters() if p.ndim >= 2]
+        hidden_gains_biases = [p for p in model.body.parameters() if p.ndim < 2]
+        non_hidden_params = [*model.head.parameters(), *model.embed.parameters()]
+
+        param_groups = [
+            dict(params=hidden_weights, lr=0.02, weight_decay=0.01, use_muon=True),
+            dict(
+                params=hidden_gains_biases + non_hidden_params,
+                lr=3e-4,
+                betas=(0.9, 0.95),
+                weight_decay=0.01,
+                use_muon=False,
+            ),
+        ]
+
+        optimizer = NorMuon(param_groups)
+
+    """
+
+    def __init__(
+        self,
+        params: ParamsT,
+        lr: float = 2e-2,
+        betas: Betas = (0.9, 0.95),
+        weight_decay: float = 0.0,
+        weight_decouple: bool = True,
+        nesterov: bool = True,
+        ns_steps: int = 5,
+        ns_coeffs: NewtonSchulzWeights = 'original',
+        adamw_lr: float = 3e-4,
+        adamw_betas: Betas = (0.9, 0.999),
+        adamw_wd: float = 0.0,
+        eps: float = 1e-10,
+        maximize: bool = False,
+        **kwargs,
+    ):
+        self.validate_learning_rate(lr)
+        self.validate_learning_rate(adamw_lr)
+        self.validate_non_negative(weight_decay, 'weight_decay')
+        self.validate_positive(ns_steps, 'ns_steps')
+        self.validate_betas(betas)
+        self.validate_betas(adamw_betas)
+        self.validate_non_negative(adamw_wd, 'adamw_wd')
+        self.validate_non_negative(eps, 'eps')
+        ns_coeffs = get_newton_schulz_weights(ns_coeffs)
+
+        self.maximize = maximize
+
+        for group in params:
+            group = cast(ParamGroup, group)
+            if 'use_muon' not in group:
+                raise ValueError('`use_muon` must be set.')
+
+            if group['use_muon']:
+                group['lr'] = group.get('lr', lr)
+                group['betas'] = group.get('betas', betas)
+                group['nesterov'] = group.get('nesterov', nesterov)
+                group['weight_decay'] = group.get('weight_decay', weight_decay)
+                group['ns_steps'] = group.get('ns_steps', ns_steps)
+                group['ns_coeffs'] = get_newton_schulz_weights(group.get('ns_coeffs', ns_coeffs))
+            else:
+                group['lr'] = group.get('lr', adamw_lr)
+                group['betas'] = group.get('betas', adamw_betas)
+                group['weight_decay'] = group.get('weight_decay', adamw_wd)
+
+            group['weight_decouple'] = group.get('weight_decouple', weight_decouple)
+            group['eps'] = group.get('eps', eps)
+
+        super().__init__(params, kwargs)
+
+    def __str__(self) -> str:
+        return 'NorMuon'
+
+    def init_group(self, group: ParamGroup, **kwargs) -> None:
+        if 'step' not in group:
+            group['step'] = 0
+
+        for p in group['params']:
+            if p.grad is None:
+                continue
+
+            grad = p.grad
+            if grad.is_sparse:
+                raise NoSparseGradientError(str(self))
+
+            if torch.is_complex(p):
+                raise NoComplexParameterError(str(self))
+
+            state = self.state[p]
+
+            if len(state) == 0:
+                if group['use_muon']:
+                    state['m'] = torch.zeros_like(p)
+                    state['v'] = torch.zeros_like(p[..., :1])
+                else:
+                    state['exp_avg'] = torch.zeros_like(p)
+                    state['exp_avg_sq'] = torch.zeros_like(p)
+
+    @torch.no_grad()
+    def step(self, closure: Closure = None) -> Loss:
+        loss: Loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            self.init_group(group)
+            group['step'] += 1
+
+            beta1, beta2 = group['betas']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+
+                self.maximize_gradient(grad, maximize=self.maximize)
+
+                state = self.state[p]
+
+                self.apply_weight_decay(
+                    p,
+                    grad=grad,
+                    lr=group['lr'],
+                    weight_decay=group['weight_decay'],
+                    weight_decouple=group['weight_decouple'],
+                    fixed_decay=False,
+                )
+
+                if group['use_muon']:
+                    m, v = state['m'], state['v']
+
+                    m.lerp_(grad, weight=1.0 - beta1)
+
+                    update = grad.lerp_(m, weight=beta1) if group['nesterov'] else m
+                    if update.ndim > 2:
+                        update = update.view(len(update), -1)
+
+                    update = zero_power_via_newton_schulz_5(
+                        update, num_steps=group['ns_steps'], weights=group['ns_coeffs']
+                    ).to(p.dtype)
+                    update = update.reshape(p.shape)
+
+                    vnorm = update.norm(dim=(-2, -1), keepdim=True)
+                    v_mean = (update * update).mean(dim=-1, keepdim=True)
+
+                    v.lerp_(v_mean, weight=1.0 - beta2)
+
+                    update = update / v.sqrt().add_(group['eps'])
+
+                    vnorm_new = update.norm(dim=(-2, -1), keepdim=True)
+
+                    update = update * (vnorm / vnorm_new.add_(group['eps']))
+
+                    update = update * max(1.0, grad.size(-2) / grad.size(-1)) ** 0.5
+
+                    p.add_(update, alpha=-group['lr'])
+                else:
+                    exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+
+                    bias_correction1: float = self.debias(beta1, group['step'])
+                    bias_correction2: float = self.debias(beta2, group['step'])
+
+                    exp_avg.lerp_(grad, weight=1.0 - beta1)
+                    exp_avg_sq.lerp_(grad.square(), weight=1.0 - beta2)
+
+                    de_nom = exp_avg_sq.sqrt().add_(group['eps']).div_(math.sqrt(bias_correction2))
+
+                    p.addcdiv_(exp_avg / bias_correction1, de_nom, value=-group['lr'])
+
+        return loss
+
+
 class AdaGO(BaseOptimizer):
     """AdaGrad Meets Muon: Adaptive Stepsizes for Orthogonal Updates.
 
@@ -889,5 +1099,7 @@ def prepare_muon_parameters(
         return AdaMuon(param_groups, **kwargs)
     if optimizer_name == 'adago':
         return AdaGO(param_groups, **kwargs)
+    if optimizer_name == 'normuon':
+        return NorMuon(param_groups, **kwargs)
 
     return Muon(param_groups, **kwargs)
