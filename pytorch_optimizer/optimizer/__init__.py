@@ -90,6 +90,7 @@ from pytorch_optimizer.optimizer.racs import RACS, Alice
 from pytorch_optimizer.optimizer.radam import RAdam
 from pytorch_optimizer.optimizer.ranger import Ranger
 from pytorch_optimizer.optimizer.ranger21 import Ranger21
+from pytorch_optimizer.optimizer.root import ROOT
 from pytorch_optimizer.optimizer.rose import ROSE
 from pytorch_optimizer.optimizer.rotograd import RotoGrad
 from pytorch_optimizer.optimizer.sam import BSAM, GSAM, SAM, WSAM, FriendlySAM, LookSAM
@@ -219,6 +220,7 @@ OPTIMIZER_LIST: List[OptimizerType] = [
     Ranger,
     Ranger21,
     Ranger25,
+    ROOT,
     ROSE,
     SCION,
     SCIONLight,
@@ -372,7 +374,7 @@ def create_optimizer(
         optimizer = optimizer_class(parameters, max_lr=lr, **kwargs)
     elif optimizer_name in ('lomo', 'adalomo', 'adammini'):
         optimizer = optimizer_class(model, lr=lr, **kwargs)
-    elif optimizer_name in ('muon', 'adamuon', 'adago'):
+    elif optimizer_name in ('muon', 'adamuon', 'adago', 'root'):
         warn(f'highly recommend you to manually create the {optimizer_name} manually.', UserWarning, stacklevel=1)
 
         optimizer = prepare_muon_parameters(model, optimizer_name, lr=lr, weight_decay=weight_decay, **kwargs)
