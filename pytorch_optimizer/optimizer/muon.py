@@ -889,5 +889,10 @@ def prepare_muon_parameters(
         return AdaMuon(param_groups, **kwargs)
     if optimizer_name == 'adago':
         return AdaGO(param_groups, **kwargs)
+    if optimizer_name == 'root':
+        # imported locally to avoid a circular import; the root module reuses get_adjusted_lr.
+        from pytorch_optimizer.optimizer.root import ROOT
+
+        return ROOT(param_groups, **kwargs)
 
     return Muon(param_groups, **kwargs)

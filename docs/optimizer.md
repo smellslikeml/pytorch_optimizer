@@ -432,6 +432,10 @@
     :docstring:
     :members:
 
+::: pytorch_optimizer.ROOT
+    :docstring:
+    :members:
+
 ::: pytorch_optimizer.ROSE
     :docstring:
     :members:
