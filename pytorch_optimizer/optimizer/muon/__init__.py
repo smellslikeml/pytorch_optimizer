@@ -5,6 +5,7 @@ from pytorch_optimizer.optimizer.muon.distributed_muon import DistributedMuon
 from pytorch_optimizer.optimizer.muon.muon import Muon
 from pytorch_optimizer.optimizer.muon.muon_clip import MuonClip
 from pytorch_optimizer.optimizer.muon.normuon import NorMuon
+from pytorch_optimizer.optimizer.muon.rode import RODE
 from pytorch_optimizer.optimizer.muon.utils import prepare_muon_parameters
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     'MuonBase',
     'MuonClip',
     'NorMuon',
+    'RODE',
     'get_adjusted_lr',
     'prepare_muon_parameters',
 ]

@@ -96,7 +96,7 @@ class TestComplexParameters:
     def test_complex_not_supported(self, no_complex_optimizer):
         param = make_parameter(dtype=torch.complex64, grad=1.0)
 
-        use_muon: bool = no_complex_optimizer in ('muon', 'adamuon', 'adago', 'normuon')
+        use_muon: bool = no_complex_optimizer in ('muon', 'adamuon', 'adago', 'normuon', 'rode')
         optimizer = build_optimizer(
             no_complex_optimizer, [param], use_muon=use_muon, **GRADIENT_OPTIONS.get(no_complex_optimizer, {})
         )
