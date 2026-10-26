@@ -84,6 +84,7 @@ from pytorch_optimizer.optimizer.muon import (
     Muon,
     MuonClip,
     NorMuon,
+    RODE,
     prepare_muon_parameters,
 )
 from pytorch_optimizer.optimizer.nero import Nero
@@ -149,6 +150,7 @@ __all__ = [
     'PNM',
     'QHM',
     'RACS',
+    'RODE',
     'ROSE',
     'SAM',
     'SCION',
@@ -386,6 +388,7 @@ OPTIMIZER_LIST: list[OptimizerType] = [
     RAdam,
     Ranger,
     Ranger21,
+    RODE,
     ROSE,
     SCION,
     SCIONLight,
@@ -616,7 +619,7 @@ def create_optimizer(
         optimizer = optimizer_class(parameters, max_lr=lr, **kwargs)
     elif optimizer_name in ('lomo', 'adalomo', 'adammini'):
         optimizer = optimizer_class(model, lr=lr, **kwargs)
-    elif optimizer_name in ('muon', 'muonclip', 'adamuon', 'adago', 'normuon'):
+    elif optimizer_name in ('muon', 'muonclip', 'adamuon', 'adago', 'normuon', 'rode'):
         warn(f'highly recommend you to manually create the {optimizer_name} manually.', UserWarning, stacklevel=1)
 
         optimizer = prepare_muon_parameters(model, optimizer_name, lr=lr, **kwargs)

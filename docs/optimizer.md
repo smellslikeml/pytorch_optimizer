@@ -440,6 +440,10 @@
     :docstring:
     :members:
 
+::: pytorch_optimizer.RODE
+    :docstring:
+    :members:
+
 ::: pytorch_optimizer.ROSE
     :docstring:
     :members:

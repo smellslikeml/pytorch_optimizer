@@ -103,7 +103,7 @@ class TestMuon:
         pytest.importorskip('torch.distributed.tensor')
         run_distributed(_check_sharded_muon, tmp_path / 'store', optimizer_name, foreach, ns_method)
 
-    @pytest.mark.parametrize('optimizer_name', ['Muon', 'MuonClip', 'AdaMuon', 'AdaGO', 'NorMuon'])
+    @pytest.mark.parametrize('optimizer_name', ['Muon', 'MuonClip', 'AdaMuon', 'AdaGO', 'NorMuon', 'RODE'])
     def test_muon_high_dimensions(self, optimizer_name):
         matrices = [make_parameter(shape, grad=1.0) for shape in ((1, 1, 1), (1, 1, 2, 2), (4, 1))]
         params = [
@@ -124,25 +124,113 @@ class TestMuon:
             for param in matrices:
                 torch.testing.assert_close(param.square().mean().sqrt(), expected_rms, rtol=1e-2, atol=1e-5)
 
-    @pytest.mark.parametrize('optimizer_name', ['Muon', 'MuonClip', 'AdaMuon', 'AdaGO', 'NorMuon'])
+    @pytest.mark.parametrize('optimizer_name', ['Muon', 'MuonClip', 'AdaMuon', 'AdaGO', 'NorMuon', 'RODE'])
     def test_muon_use_muon_param(self, optimizer_name):
         with pytest.raises(ValueError):
             load_optimizer(optimizer_name)([{'params': [make_parameter()]}])
 
-    @pytest.mark.parametrize('optimizer_name', ['Muon', 'MuonClip', 'AdaMuon', 'AdaGO', 'NorMuon'])
+    @pytest.mark.parametrize('optimizer_name', ['Muon', 'MuonClip', 'AdaMuon', 'AdaGO', 'NorMuon', 'RODE'])
     def test_muon_invalid_ns_coeffs(self, optimizer_name):
         with pytest.raises(ValueError):
             load_optimizer(optimizer_name)(
                 [{'params': [make_parameter((2, 2))], 'use_muon': True}], ns_coeffs='invalid'
             )
 
-    @pytest.mark.parametrize('optimizer_name', ['Muon', 'MuonClip'])
+    @pytest.mark.parametrize('optimizer_name', ['Muon', 'MuonClip', 'RODE'])
     @pytest.mark.parametrize('group_option', [False, True])
     def test_invalid_ns_method(self, optimizer_name, group_option):
         options = {'ns_method': 'invalid'}
         group = {'params': [make_parameter()], 'use_muon': True, **(options if group_option else {})}
         with pytest.raises(ValueError, match='ns_method'):
             load_optimizer(optimizer_name)([group], **({} if group_option else options))
+
+
+class TestRODE:
+    @pytest.mark.parametrize(
+        ('param_name', 'param_value'),
+        [
+            ('eta_rho', -0.1),
+            ('kappa_floor', -0.1),
+            ('kappa_floor', 0.0),
+            ('kappa_floor', 1.1),
+            ('eps', -1e-12),
+        ],
+    )
+    def test_invalid_parameters(self, param_name, param_value):
+        group = {'params': [make_parameter((2, 2))], 'use_muon': True}
+        with pytest.raises(ValueError):
+            load_optimizer('rode')([group], **{param_name: param_value})
+
+    @pytest.mark.parametrize('foreach', [False, True])
+    def test_radial_channel_floors_the_norm(self, foreach):
+        weight = torch.randn(3, 3)
+        p = weight.clone().requires_grad_(True)
+        direction = weight / weight.norm()
+        optimizer = build_optimizer(
+            'rode',
+            [{'params': [p], 'use_muon': True}],
+            lr=0.1,
+            momentum=0.0,
+            eta_rho=1e3,
+            kappa_floor=0.5,
+            foreach=foreach,
+        )
+
+        for _ in range(3):
+            norm = p.norm()
+
+            p.grad = 2.0 * direction  # purely radial gradient: the tangent kernel vanishes
+            optimizer.step()
+
+            torch.testing.assert_close(p.norm(), 0.5 * norm)
+            torch.testing.assert_close(p / p.norm(), direction)
+
+    def test_tangent_kernel_rotates_without_touching_the_norm(self):
+        weight = torch.randn(3, 4)
+        p = weight.clone().requires_grad_(True)
+        rho = weight.norm()
+        direction = weight / rho
+        grad = torch.randn(3, 4)
+        grad = grad - (grad * direction).sum() * direction  # tangent gradient: <g, U> = 0
+
+        optimizer = build_optimizer('rode', [{'params': [p], 'use_muon': True}], lr=0.2, momentum=0.0, eta_rho=1.0)
+        p.grad = grad.clone()
+        optimizer.step()
+
+        kernel = zero_power_via_newton_schulz_5(grad).float()
+        kernel = kernel - (kernel * direction).sum() * direction
+        tangent = kernel / kernel.norm()
+        theta = 0.2 * kernel.norm()
+        expected = direction * torch.cos(theta) - tangent * torch.sin(theta)
+        expected = expected / expected.norm()
+
+        torch.testing.assert_close(p.norm(), rho)
+        torch.testing.assert_close(p, rho * expected, rtol=1e-4, atol=1e-6)
+        assert not torch.allclose(p, weight)
+
+    def test_norm_decoupled_from_tangent_magnitude(self):
+        weight = torch.randn(3, 3)
+        rode_params = [weight.clone().requires_grad_(True) for _ in range(2)]
+        muon_params = [weight.clone().requires_grad_(True) for _ in range(2)]
+        rode = build_optimizer('rode', [{'params': rode_params, 'use_muon': True}], lr=0.3, momentum=0.9, eta_rho=0.1)
+        muon = build_optimizer('muon', [{'params': muon_params, 'use_muon': True}], lr=0.3, momentum=0.9)
+
+        torch.manual_seed(7)
+        for _ in range(4):
+            for index, (rode_p, muon_p) in enumerate(zip(rode_params, muon_params)):
+                radial = rode_p / rode_p.norm()  # each parameter follows its own direction
+                tangent = torch.randn_like(rode_p)
+                tangent = tangent - (tangent * radial).sum() * radial
+                grad = radial + (0.0 if index == 0 else 3.0) * tangent
+
+                rode_p.grad = grad.clone()
+                muon_p.grad = grad.clone()
+
+            rode.step()
+            muon.step()
+
+        torch.testing.assert_close(rode_params[0].norm(), rode_params[1].norm())
+        assert not torch.allclose(muon_params[0].norm(), muon_params[1].norm())
 
 
 class TestMuonClip:
