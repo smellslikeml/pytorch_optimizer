@@ -9,6 +9,7 @@ from pytorch_optimizer.optimizer.muon.adamuon import AdaMuon
 from pytorch_optimizer.optimizer.muon.muon import Muon
 from pytorch_optimizer.optimizer.muon.muon_clip import MuonClip
 from pytorch_optimizer.optimizer.muon.normuon import NorMuon
+from pytorch_optimizer.optimizer.muon.rode import RODE
 
 if TYPE_CHECKING:
     from pytorch_optimizer.base.type import ParamsT
@@ -79,5 +80,7 @@ def prepare_muon_parameters(
         return AdaGO(param_groups, **kwargs)
     if optimizer_name == 'normuon':
         return NorMuon(param_groups, **kwargs)
+    if optimizer_name == 'rode':
+        return RODE(param_groups, **kwargs)
 
     return Muon(param_groups, **kwargs)
