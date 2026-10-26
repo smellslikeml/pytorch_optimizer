@@ -1,111 +1,142 @@
 # Contributing
 
-Contributions to `pytorch-optimizer` for code, documentation, and tests are always welcome!
+Contribute code, tests, or documentation. Follow the existing implementations.
+Keep each pull request focused on one problem.
 
-## Setup
+## Setup and checks
 
-```bash
-# Clone the repository
-git clone https://github.com/kozistr/pytorch_optimizer.git
-cd pytorch_optimizer
+1. Install [uv](https://docs.astral.sh/uv/).
+2. Clone the repository.
+3. Install the development dependencies from the repository root:
 
-# Install dependencies using uv (recommended)
+```shell
 uv sync
 ```
 
-## Development Commands
+Run these checks before you submit a pull request:
 
-```bash
-# Format code
+```shell
 uv run just format
-
-# Lint code
-uv run just lint
-
-# Full check (lint + type checking)
 uv run just check
-
-# Run tests
 uv run just test
-
-# Run a specific test
-uv run pytest tests/test_optimizers.py::test_name -sv -vv
-
-# Serve documentation locally
-uv run just docs
-
-# Build documentation with warnings treated as errors
-uv run just docs-build
+uv run coverage report -m
 ```
 
-## Code Style
+Cover new and changed implementation code at **100%**.
+Run tests on CPU by default.
+For GPU tests, run `python -m pytest --device=cuda` with a CUDA-enabled PyTorch interpreter.
 
-- Line length: **119** characters
-- Use **single quotes** for strings (not double quotes)
-- Formatter and linter: **ruff**
-- Docstring style: **Google style** ([example](https://github.com/kozistr/pytorch_optimizer/blob/main/pytorch_optimizer/optimizer/adamp.py#L14))
+## Code
 
-Run `uv run just format` and `uv run just check` before submitting a PR.
+- Use single-quoted strings and a maximum line length of 119 characters.
+- Separate logical steps with blank lines.
+- Follow the original paper when you implement an optimizer.
+- Reuse existing `BaseOptimizer` helpers.
+- Inherit from `BaseOptimizer` when you add an optimizer.
+- Register the optimizer in `OPTIMIZER_LIST`.
+- Register new components in the appropriate package exports.
+- Update the corresponding README tables.
+
+## Tests
+
+**Add a test or recipe only for uncovered implementation changes or a demonstrated regression.**
+An implementation change does not require a new test or recipe.
+Reuse existing tests for refactors and performance changes when they check the behavior and preserve 100% coverage.
+
+### Decide whether to add a case
+
+Before editing tests:
+
+1. Read the relevant shared tests, focused tests, and recipes.
+2. Run the existing suite with `uv run just test` against the implementation change.
+3. Run `uv run coverage report -m` to locate uncovered implementation lines.
+4. Identify any incorrect result or failure that existing assertions would miss.
+
+For a regression, demonstrate that the case fails without the fix and passes with it.
+Line coverage alone does not prove correctness.
+A demonstrated regression can justify a case without increasing coverage.
+
+Identify the uncovered lines or regression for each proposed addition.
+Explain why existing tests do not already cover the gap.
+Extend an existing case when its purpose remains clear.
+Otherwise, add the smallest focused case that closes the gap.
+Leave tests and recipes unchanged when you find no gap.
+
+### Use shared tests and recipes
+
+The shared tests already cover training, validation, variants, checkpoints, wrappers, and optimizer interfaces.
+Check their assertions before adding those checks to `tests/optimizers/test_<module>.py`.
+Keep shared cases in their existing `tests/test_*.py` modules.
+Run shared interface checks once per optimizer.
+Reuse capability detection from [tests/optimizer_cases.py](tests/optimizer_cases.py).
+Do not maintain separate optimizer name lists for shared checks.
+
+Add one baseline `(optimizer_name, options, iterations)` recipe for a new optimizer in
+[tests/recipes.py](tests/recipes.py).
+For an existing optimizer, change or add a recipe only when a specific coverage gap or regression requires training.
+Do not add a recipe for each modified optimizer, option, dtype, or variant.
+Inspect `TRAINING_CASES` in [tests/test_optimizers.py](tests/test_optimizers.py) first.
+Existing recipes already generate dtype and foreach variants.
+Use the shared runner for model-based optimizers when their update protocol fits.
+Do not add standalone convergence or smoke tests that the shared runner already covers.
+
+### Keep focused cases small
+
+- Give each case an assertion that detects the identified failure.
+- Test observable results.
+  Do not add assertions about helper call counts or private batch layouts to test an optimization.
+- Measure speed with benchmarks. Keep timing thresholds out of ordinary unit tests.
+- Parametrize only combinations that expose distinct gaps.
+  Avoid Cartesian products without a reason for each combination.
+- Reuse models and parameter builders from [tests/fixtures.py](tests/fixtures.py).
+  Reuse helpers from [tests/utils/](tests/utils/).
+- Use `build_optimizer()` for ordinary setup.
+  Use `load_optimizer()` for constructor validation.
+  Use `create_optimizer()` for factory tests.
+- Use a parameter when the test only calls optimizer methods.
+  Use a model when the tested API requires one.
+- Add shapes or model features only when the identified gap requires them.
+- Use small, deterministic inputs and the minimum meaningful training iterations.
+- Compare numerical results with `torch.testing.assert_close()`. Use known values or a trusted reference.
+- Check expected exceptions with `pytest.raises()`.
+- Group related cases in pytest classes when they share setup.
+- Keep variant, scheduler, and loss case data beside their tests.
+- Copy recipe options before modification.
+  Do not retain model instances or optimizer state in shared case data.
+- Preserve random state in probes and propagate unexpected failures.
+  Keep protocol exclusions explicit.
+- Avoid session-wide performance overrides.
+
+### Review test additions
+
+Run the required checks and inspect the final coverage report.
+Remove additions that repeat existing checks without detecting a distinct failure
+or covering missing implementation code.
+Preserve existing regression assertions and 100% implementation coverage.
+Report test results and coverage in the pull request.
+For each added case or recipe, identify the gap it closes and why the existing suite was insufficient.
 
 ## Documentation
 
-We use [Zensical](https://zensical.org/) with `mkdocstrings` for the API reference.
-The `docs` and `docs-build` recipes install documentation dependencies in an isolated Python 3.12 environment.
+- Write API docstrings in Google style alongside the implementation.
+- Write documentation pages in `docs/`.
+- Add usage examples to [docs/getting-started.md](docs/getting-started.md).
+- Update `README.md` when you add components or change public usage.
+- Run `uv run just docs-build`.
+- Resolve build errors and warnings before you submit changes to the site.
 
-- Edit navigation and theme settings in `zensical.toml`.
-- Keep the documentation home page in `docs/index.md` and usage examples in `docs/getting-started.md`.
-- Run `uv run just update-docs` after changing public exports to regenerate the optimizer, scheduler, and loss references.
-- Indent nested changelog bullets by four spaces per level. Use `#123` for issue and PR references; the site links them to GitHub.
-- Run `uv run just docs-build` before submitting documentation changes.
+## Pull requests
 
-### Release notes
+Describe the problem, the resulting behavior, and how you tested the change.
+Include the paper or reference implementation for each new optimizer.
+Explain any differences from the original algorithm.
+Report checks you could not run.
 
-When a maintainer pushes a `vMAJOR.MINOR.PATCH` tag, the publish workflow asks GitHub to generate release notes from merged PRs.
-It creates the GitHub release, then opens a PR to sync that release's notes into `CHANGELOG.md`,
-`docs/changelogs/<tag>.md`, and the changelog index. The changelog PR uses the existing `automerge` label.
-Rerunning the workflow updates the existing version section instead of adding it twice.
+Start commit subjects with `feat:`, `fix:`, `perf:`, `style:`, `refactor:`, `docs:`, `chore:`, `build:`, or `update:`.
+Use concise, specific commit subjects and pull request titles.
 
-Write PR titles that explain the change to users. You do not need to maintain a separate changelog entry before a release.
-If a maintainer edits the published release notes, rerun the changelog job to sync those edits.
+Review code and tests from coding agents or large language models before you submit them.
+Make sure you understand the implementation and tests.
+You are responsible for the changes you submit.
 
-## Adding New Optimizers, Loss Functions, or LR Schedulers
-
-Reference existing implementations:
-- Optimizers: `pytorch_optimizer/optimizer/`
-- Loss functions: `pytorch_optimizer/loss/`
-- LR schedulers: `pytorch_optimizer/lr_scheduler/`
-
-### Checklist
-
-1. Create a new file in the appropriate directory
-2. For optimizers: inherit from `BaseOptimizer`, implement `init_group()` and `step()`
-3. Utilize existing `BaseOptimizer` methods instead of reimplementing:
-   - `apply_weight_decay()`, `apply_ams_bound()`, `apply_adam_debias()`
-   - `debias()`, `debias_beta()`, `get_rectify_step_size()`
-   - `apply_cautious()`, `get_adanorm_gradient()`
-   - `validate_learning_rate()`, `validate_betas()`, `validate_range()`
-4. Register in the corresponding `__init__.py` files
-5. Run `uv run just format` and `uv run just check`
-6. Add tests with **100% coverage** requirement
-7. For new optimizers: add a minimal training recipe to `tests/constants.py` (see `OPTIMIZERS` list)
-8. Describe the user-visible change in the PR title and description for the generated release notes.
-9. Update `README.md`:
-   - Update the count of optimizers/loss functions/schedulers
-   - Add entry to the appropriate markdown table
-
-## Testing
-
-Tests are in `tests/` directory:
-- `test_optimizers.py` - Main optimizer tests
-- `test_optimizer_parameters.py` - Parameter validation tests
-- `test_optimizer_variants.py` - Variant tests (Cautious, AdamD, etc.)
-- `test_loss_functions.py` - Loss function tests
-- `test_lr_schedulers.py` - Scheduler tests
-
-100% test coverage is required.
-
-## Questions
-
-If you have any questions about contribution, please ask in the Issues, Discussions, or just in PR :)
-
-Thank you!
+Ask questions in an issue, a discussion, or your pull request.

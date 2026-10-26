@@ -1,4 +1,3 @@
-from typing import List, Optional, Tuple
 
 import torch
 from torch.nn.functional import logsigmoid, one_hot
@@ -12,16 +11,19 @@ def soft_dice_score(
     target: torch.Tensor,
     label_smooth: float = 0.0,
     eps: float = 1e-6,
-    dims: Optional[Tuple[int, ...]] = None,
+    dims: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
-    """Get soft dice score.
+    """Compute the soft Dice score from probabilities and target masks.
 
     Args:
-        output (torch.Tensor): Predicted segmentation probabilities.
-        target (torch.Tensor): Ground truth segmentation masks.
-        label_smooth (float): Label smoothing factor to avoid zero denominators.
-        eps (float): Small epsilon for numerical stability.
-        dims (Optional[Tuple[int, ...]]): Dimensions over which to reduce when computing score.
+        output: Predicted segmentation probabilities.
+        target: Ground truth segmentation masks.
+        label_smooth: Additive smoothing constant for the numerator and denominator.
+        eps: Small epsilon for numerical stability.
+        dims: Dimensions over which to reduce when computing score.
+
+    Returns:
+        torch.Tensor: Score after reducing `dims`, or a scalar when `dims=None`.
 
     """
     if dims is not None:
@@ -35,30 +37,30 @@ def soft_dice_score(
 
 
 class DiceLoss(_Loss):
-    """Dice loss for image segmentation task.
+    """Dice loss for binary, multiclass, or multilabel segmentation.
 
     Reference:
         https://github.com/BloodAxe/pytorch-toolbelt
 
     Args:
-        mode (ClassMode): Loss mode - 'binary', 'multiclass', or 'multilabel'.
-        classes (Optional[List[int]]): List of classes to include in loss computation. Defaults to all classes.
-        log_loss (bool): If True, loss is computed as `-log(dice_coeff)`; otherwise `1 - dice_coeff`.
-        from_logits (bool): If True, assumes input is raw logits.
-        label_smooth (float): Smoothness constant for dice coefficient numerator and denominator.
-        ignore_index (Optional[int]): Label to ignore during loss computation.
-        eps (float): Small epsilon for numerical stability.
+        mode: Segmentation mode: `'binary'`, `'multiclass'`, or `'multilabel'`.
+        classes: List of classes to include in loss computation. Defaults to all classes.
+        log_loss: Compute `-log(dice_coeff)` instead of `1 - dice_coeff`.
+        from_logits: If True, assumes input is raw logits.
+        label_smooth: Smoothness constant for dice coefficient numerator and denominator.
+        ignore_index: Label to ignore during loss computation.
+        eps: Small epsilon for numerical stability.
 
     """
 
     def __init__(
         self,
         mode: ClassMode = 'binary',
-        classes: Optional[List[int]] = None,
+        classes: list[int] | None = None,
         log_loss: bool = False,
         from_logits: bool = True,
         label_smooth: float = 0.0,
-        ignore_index: Optional[int] = None,
+        ignore_index: int | None = None,
         eps: float = 1e-6,
     ):
         super().__init__()
@@ -75,6 +77,17 @@ class DiceLoss(_Loss):
         self.ignore_index = ignore_index
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Compute the segmentation loss, excluding channels with no target pixels.
+
+        Args:
+            y_pred: Predictions with shape `(N, C, ...)`. Use logits when `from_logits=True`.
+            y_true: Class indices with shape `(N, ...)` for multiclass mode. Binary masks matching the predictions for
+                multilabel mode. Binary mode also accepts `(N, ...)`. Inputs may be non-contiguous.
+
+        Returns:
+            torch.Tensor: Scalar loss averaged over the selected channels.
+
+        """
         if self.from_logits:
             # Apply activations to get [0..1] class probabilities
             # Using Log-Exp as this gives more numerically stable result and does not cause vanishing gradient on
@@ -84,11 +97,11 @@ class DiceLoss(_Loss):
         bs: int = y_true.size(0)
         num_classes: int = y_pred.size(1)
 
-        dims: Tuple[int, ...] = (0, 2)
+        dims: tuple[int, ...] = (0, 2)
 
         if self.mode == 'binary':
-            y_true = y_true.view(bs, 1, -1)
-            y_pred = y_pred.view(bs, 1, -1)
+            y_true = y_true.reshape(bs, 1, -1)
+            y_pred = y_pred.reshape(bs, 1, -1)
 
             if self.ignore_index is not None:
                 mask = y_true != self.ignore_index
@@ -96,8 +109,8 @@ class DiceLoss(_Loss):
                 y_true = y_true * mask
 
         if self.mode == 'multiclass':
-            y_true = y_true.view(bs, -1)
-            y_pred = y_pred.view(bs, num_classes, -1)
+            y_true = y_true.reshape(bs, -1)
+            y_pred = y_pred.reshape(bs, num_classes, -1)
 
             if self.ignore_index is not None:
                 mask = y_true != self.ignore_index
@@ -110,8 +123,8 @@ class DiceLoss(_Loss):
                 y_true = y_true.permute(0, 2, 1)
 
         if self.mode == 'multilabel':
-            y_true = y_true.view(bs, num_classes, -1)
-            y_pred = y_pred.view(bs, num_classes, -1)
+            y_true = y_true.reshape(bs, num_classes, -1)
+            y_pred = y_pred.reshape(bs, num_classes, -1)
 
             if self.ignore_index is not None:
                 mask = y_true != self.ignore_index
@@ -147,6 +160,6 @@ class DiceLoss(_Loss):
         target: torch.Tensor,
         label_smooth: float = 0.0,
         eps: float = 1e-6,
-        dims: Optional[Tuple[int, ...]] = None,
+        dims: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         return soft_dice_score(output, target, label_smooth, eps, dims)

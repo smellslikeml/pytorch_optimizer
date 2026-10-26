@@ -1,6 +1,6 @@
 [project]
 name = "pytorch_optimizer"
-version = "3.10.1"
+version = "4.1.0"
 description = "optimizer & lr scheduler & objective function collections in PyTorch"
 license = { text = "Apache-2.0" }
 readme = "README.md"
@@ -35,8 +35,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -51,23 +49,18 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
-    'numpy>1.24.4; python_version >= "3.9"',
-    'numpy<=1.24.4; python_version < "3.9"',
-    "torch>=1.10,<2.5; python_full_version < '3.9'",
-    'torch>=1.10,<2.9; python_version >= "3.9" and python_version < "3.10"',
-    'torch>=1.10; python_version >= "3.10"',
+    'numpy>1.24.4',
+    'torch>=2.1',
 ]
 
 [dependency-groups]
 dev = [
-    'ruff>=0.16.9,<0.17',
-    'pyright==1.1.414',
-    'pytest<9; python_version < "3.10"',
-    'pytest>=9.1.1,<10; python_version >= "3.10"',
-    'pytest-cov<6; python_version < "3.9"',
-    'pytest-cov>=7.1.0,<8; python_version >= "3.9"',
+    'ruff==0.16.10',
+    'ty==0.0.84',
+    'pytest==9.1.1',
+    'pytest-cov==7.1.0',
 ]
 
 [tool.uv.sources]
@@ -102,13 +95,14 @@ exclude = [
 select = [
     "A", "B", "C4", "D", "E", "F", "G", "I", "N", "S", "T", "ISC", "ICN", "W", "INP", "PIE", "T20", "RET", "SIM",
     "TID", "ARG", "ERA", "RUF", "YTT", "PL", "Q", "TD", "TC", "SLOT", "RSE", "PT",
+    "UP006", "UP007", "UP035", "UP045",
 ]
 ignore = [
     "B905",
     "D100", "D102", "D104", "D105", "D107", "D203", "D213",
     "PLR0913", "PLR2004", "PLW2901",
     "Q003", "ARG002",
-    "TD003", "TC002", "TC006", "PT011",
+    "TD003", "TC002", "TC003", "TC006", "PT011",
 ]
 fixable = ["ALL"]
 unfixable = ["F401"]
@@ -137,22 +131,29 @@ max-positional-args = 23
 [tool.ruff.format]
 quote-style = "single"
 
-[tool.pyright]
+[tool.ty.src]
 include = ["pytorch_optimizer", "examples"]
 exclude = [
     "./pytorch_optimizer/optimizer/adam_mini.py",
     "./pytorch_optimizer/optimizer/demo.py",
     "./pytorch_optimizer/optimizer/rotograd.py",
 ]
-reportArgumentType = false
-reportAttributeAccessIssue = false
-reportCallIssue = false
-reportIncompatibleMethodOverride = false
-reportIncompatibleVariableOverride = false
-reportMissingImports = false
-reportOptionalMemberAccess = false
-pythonVersion = "3.12"
-pythonPlatform = "Linux"
+
+[tool.ty.environment]
+python-version = "3.12"
+python-platform = "linux"
+
+[tool.ty.analysis]
+allowed-unresolved-imports = [
+    "bitsandbytes.**", "datasets.**", "hyperopt.**", "matplotlib.**", "pytorch_lightning.**", "q_galore_torch.**",
+    "torchao.**", "torchvision.**", "transformers.**", "trl.**",
+]
+
+[tool.ty.rules]
+invalid-argument-type = "ignore"
+unresolved-attribute = "ignore"
+no-matching-overload = "ignore"
+invalid-method-override = "ignore"
 
 [tool.pytest.ini_options]
 testpaths = "tests"

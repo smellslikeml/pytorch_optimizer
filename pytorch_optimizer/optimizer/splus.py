@@ -1,4 +1,3 @@
-from typing import Tuple
 
 import torch
 
@@ -12,31 +11,35 @@ from pytorch_optimizer.base.type import (
     ParamGroup,
     ParamsT,
 )
+from pytorch_optimizer.optimizer.utils.foreach import foreach_add_, group_tensors_by_device_and_dtype
 
 
 class SPlus(BaseOptimizer):
-    """A Stable Whitening Optimizer for Efficient Neural Network Training.
+    """Adaptive updates with matrix whitening and gradient momentum.
 
     Args:
-        params (ParamsT): Iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): Learning rate.
-        betas (Betas): Coefficients used for computing running averages of gradient and the squared Hessian trace.
-        weight_decay (float): Weight decay (L2 penalty).
-        weight_decouple (bool): Whether the optimizer uses decoupled weight decay as in AdamW.
-        fixed_decay (bool): Whether to fix weight decay.
-        ema_rate (float): Exponential moving average decay rate.
-        inverse_steps (int): Number of steps to perform inverse.
-        nonstandard_constant (float): Scale factor for the learning rate in case of a non-linear layer.
-        max_dim (int): Maximum number of dimensions to perform the operation on.
-        eps (float): Term added to the denominator to improve numerical stability.
-        maximize (bool): Maximize the objective with respect to the parameters instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        betas: Decay rates for the first and second moments.
+        weight_decay: Weight decay coefficient.
+        weight_decouple: Apply weight decay to parameters instead of adding it to the gradient.
+        fixed_decay: Apply decoupled weight decay without scaling it by the learning rate.
+        ema_rate: Exponential moving average decay rate.
+        inverse_steps: Number of steps between inverse root preconditioner updates.
+        nonstandard_constant: Scale factor for the learning rate in case of a nonlinear layer.
+        max_dim: Largest tensor dimension to include in matrix preconditioning.
+        eps: Term added to the denominator to improve numerical stability.
+        maximize: Maximize the objective instead of minimizing it.
+        foreach: Batch nonmatrix updates. `None` enables batching for supported groups.
 
     """
+
+    _supports_compiled_foreach = True
 
     def __init__(
         self,
         params: ParamsT,
-        lr: float = 1e-1,
+        lr: float | torch.Tensor = 1e-1,
         betas: Betas = (0.9, 0.999),
         weight_decay: float = 1e-2,
         weight_decouple: bool = True,
@@ -47,6 +50,7 @@ class SPlus(BaseOptimizer):
         max_dim: int = 10000,
         eps: float = 1e-30,
         maximize: bool = False,
+        foreach: bool | None = None,
         **kwargs,
     ):
         self.validate_learning_rate(lr)
@@ -71,6 +75,7 @@ class SPlus(BaseOptimizer):
             'nonstandard_constant': nonstandard_constant,
             'eps': eps,
             'train_mode': True,
+            'foreach': foreach,
         }
 
         super().__init__(params, defaults)
@@ -125,17 +130,45 @@ class SPlus(BaseOptimizer):
                         for d in p.shape
                     ]
                     state['q_sides'] = [
-                        torch.eye(d, device=p.device, dtype=p.dtype) if d < group['max_dim'] else None for d in p.shape
+                        torch.eye(d, device=p.device).to(p.dtype) if d < group['max_dim'] else None for d in p.shape
                     ]
 
     @staticmethod
-    def get_scaled_lr(shape: Tuple[int, int], lr: float, nonstandard_constant: float, max_dim: int = 10000) -> float:
+    def get_scaled_lr(
+        shape: tuple[int, int], lr: float | torch.Tensor, nonstandard_constant: float, max_dim: int = 10000
+    ) -> float | torch.Tensor:
         scale: float = (
             nonstandard_constant
             if len(shape) != 2 or shape[0] > max_dim or shape[1] > max_dim
             else 2.0 / (shape[0] + shape[1])
         )
         return lr * scale
+
+    def _step_foreach(
+        self,
+        group: ParamGroup,
+        params: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        state: dict[str, list[torch.Tensor]],
+    ) -> None:
+        scaled_lr = group['lr'] * group['nonstandard_constant']
+
+        if self.maximize:
+            torch._foreach_neg_(grads)
+
+        if not group['weight_decouple']:
+            self.apply_weight_decay_foreach(
+                params, grads, scaled_lr, group['weight_decay'], False, group['fixed_decay']
+            )
+
+        torch._foreach_lerp_(state['momentum'], grads, weight=1.0 - group['betas'][0])
+        foreach_add_(params, torch._foreach_sign(state['momentum']), alpha=-scaled_lr)
+        torch._foreach_lerp_(state['ema'], params, weight=1.0 - group['ema_rate'])
+
+        if group['weight_decouple']:
+            self.apply_weight_decay_foreach(
+                params, grads, scaled_lr, group['weight_decay'], True, group['fixed_decay']
+            )
 
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
@@ -150,8 +183,16 @@ class SPlus(BaseOptimizer):
 
             beta1, beta2 = group['betas']
 
+            batched_params: set[torch.Tensor] = set()
+            if self.can_use_foreach(group, group.get('foreach')):
+                update_group = {**group, 'params': [p for p in group['params'] if p.ndim != 2]}
+                params, grads, state = self.collect_trainable_params(update_group, self.state, ['momentum', 'ema'])
+                batched_params.update(params)
+                for batch in group_tensors_by_device_and_dtype(params, grads, state):
+                    self._step_foreach(group, batch['params'], batch['grads'], batch)
+
             for p in group['params']:
-                if p.grad is None:
+                if p.grad is None or p in batched_params:
                     continue
 
                 grad = p.grad
@@ -160,18 +201,19 @@ class SPlus(BaseOptimizer):
 
                 state = self.state[p]
 
-                scaled_lr: float = self.get_scaled_lr(
+                scaled_lr: float | torch.Tensor = self.get_scaled_lr(
                     p.shape, group['lr'], group['nonstandard_constant'], group['max_dim']
                 )
 
-                self.apply_weight_decay(
-                    p=p,
-                    grad=grad,
-                    lr=scaled_lr,
-                    weight_decay=group['weight_decay'],
-                    weight_decouple=group['weight_decouple'],
-                    fixed_decay=group['fixed_decay'],
-                )
+                if not group['weight_decouple']:
+                    self.apply_weight_decay(
+                        p=p,
+                        grad=grad,
+                        lr=scaled_lr,
+                        weight_decay=group['weight_decay'],
+                        weight_decouple=False,
+                        fixed_decay=group['fixed_decay'],
+                    )
 
                 m, ema = state['momentum'], state['ema']
                 m.lerp_(grad, weight=1.0 - beta1)
@@ -213,5 +255,15 @@ class SPlus(BaseOptimizer):
                 p.add_(update, alpha=-scaled_lr)
 
                 ema.lerp_(p, weight=1.0 - group['ema_rate'])
+
+                if group['weight_decouple']:
+                    self.apply_weight_decay(
+                        p=p,
+                        grad=grad,
+                        lr=scaled_lr,
+                        weight_decay=group['weight_decay'],
+                        weight_decouple=True,
+                        fixed_decay=group['fixed_decay'],
+                    )
 
         return loss

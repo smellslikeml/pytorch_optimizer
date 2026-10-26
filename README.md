@@ -3,7 +3,7 @@
 ![CI](https://img.shields.io/github/actions/workflow/status/kozistr/pytorch_optimizer/ci.yml?branch=main&style=for-the-badge&logo=github)
 [![Docs](https://img.shields.io/readthedocs/pytorch-optimizers?style=for-the-badge&logo=readthedocs)](https://pytorch-optimizers.readthedocs.io/en/latest/?badge=latest)
 [![PyPI](https://img.shields.io/pypi/v/pytorch-optimizer?style=for-the-badge&logo=pypi)](https://pypi.org/project/pytorch-optimizer/)
-[![Python](https://img.shields.io/pypi/pyversions/pytorch-optimizer?style=for-the-badge&logo=python)](https://pypi.org/project/pytorch-optimizer/)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=for-the-badge&logo=python)](https://pypi.org/project/pytorch-optimizer/)
 [![Codecov](https://img.shields.io/codecov/c/github/kozistr/pytorch_optimizer?style=for-the-badge&logo=codecov)](https://codecov.io/gh/kozistr/pytorch_optimizer)
 [![License](https://img.shields.io/badge/license-Apache%202.0-brightgreen?style=for-the-badge)](https://opensource.org/licenses/Apache-2.0)
 ![Total Downloads](https://img.shields.io/pepy/dt/pytorch_optimizer?style=for-the-badge&label=Total%20Downloads)
@@ -26,8 +26,8 @@ Highly inspired by [jettify/pytorch-optimizer](https://github.com/jettify/pytorc
 ## Installation
 
 Requirements:
-- Python `>=3.8`
-- PyTorch `>=1.10`
+- Python `>=3.10`
+- PyTorch `>=2.1`
 
 ```bash
 pip install pytorch-optimizer
@@ -83,6 +83,25 @@ model = YourModel()
 opt_cls = torch.hub.load('kozistr/pytorch_optimizer', 'adamp')
 optimizer = opt_cls(model.parameters(), lr=1e-3)
 ```
+
+### 5) Optional: compile optimizer steps
+
+Set `compile=True` to let PyTorch optimize and automatically fuse optimizer updates:
+
+```python
+from pytorch_optimizer import create_optimizer
+
+optimizer = create_optimizer(model, 'laprop', lr=1e-3, compile=True)
+```
+
+The library selects the batched update path automatically for supported optimizers.
+The compiler chooses which operations to fuse; no separate fusion setting is required.
+Use `compile=False` (the default) for eager execution.
+
+See the [compilation guide](https://pytorch-optimizers.readthedocs.io/en/latest/getting-started/#compile-optimizer-steps)
+for optimizer support, execution settings, and graph diagnostics.
+
+Muon, MuonClip, and AdaMuon also support [FSDP2 training](docs/getting-started.md#train-muon-with-fsdp2) across GPUs and nodes.
 
 ## Discover Available Components
 
@@ -151,6 +170,7 @@ get_supported_optimizers(['adam*', 'ranger*'])
 | Ranger21              | *a synergistic deep learning optimizer*                                                                        | [github](https://github.com/lessw2020/Ranger21)                                                                | [paper](https://arxiv.org/abs/2106.13731)([cite](https://github.com/lessw2020/Ranger21#referencing-this-work))                                                                                            |
 | Lamb                  | *Large Batch Optimization for Deep Learning*                                                                   | [github](https://github.com/cybertronai/pytorch-lamb)                                                          | [paper](https://arxiv.org/abs/1904.00962)([cite](https://ui.adsabs.harvard.edu/abs/2019arXiv190400962Y/exportcitation))                                                                                   |
 | Shampoo               | *Preconditioned Stochastic Tensor Optimization*                                                                | [github](https://github.com/moskomule/shampoo.pytorch)                                                         | [paper](https://arxiv.org/abs/1802.09568)([cite](https://ui.adsabs.harvard.edu/abs/2018arXiv180209568G/exportcitation))                                                                                   |
+| DASH                  | *Faster Shampoo via Batched Block Preconditioning and Efficient Inverse-Root Solvers*                            | [github](https://github.com/IST-DASLab/ISTA-DASLab-Optimizers)                                                 | [paper](https://arxiv.org/abs/2602.02016)                                                                                                                                                                   |
 | Nero                  | *Learning by Turning: Neural Architecture Aware Optimisation*                                                  | [github](https://github.com/jxbz/nero)                                                                         | [paper](https://arxiv.org/abs/2102.07227)([cite](https://ui.adsabs.harvard.edu/abs/2021arXiv210207227L/exportcitation))                                                                                   |
 | Adan                  | *Adaptive Nesterov Momentum Algorithm for Faster Optimizing Deep Models*                                       | [github](https://github.com/sail-sg/Adan)                                                                      | [paper](https://arxiv.org/abs/2208.06677)([cite](https://ui.adsabs.harvard.edu/abs/2022arXiv220806677X/exportcitation))                                                                                   |
 | Adai                  | *Disentangling the Effects of Adaptive Learning Rate and Momentum*                                             | [github](https://github.com/zeke-xie/adaptive-inertia-adai)                                                    | [paper](https://arxiv.org/abs/2006.15815)([cite](https://github.com/zeke-xie/adaptive-inertia-adai#citing))                                                                                               |
@@ -220,6 +240,7 @@ get_supported_optimizers(['adam*', 'ranger*'])
 | TRAC                  | *Adaptive Parameter-free Optimization*                                                                         | [github](https://github.com/ComputationalRobotics/TRAC)                                                        | [paper](https://arxiv.org/abs/2405.16642)([cite](https://ui.adsabs.harvard.edu/abs/2024arXiv240516642M/exportcitation))                                                                                   |
 | AdamG                 | *Towards Stability of Parameter-free Optimization*                                                             |                                                                                                                | [paper](https://arxiv.org/abs/2405.04376)([cite](https://ui.adsabs.harvard.edu/abs/2024arXiv240504376P/exportcitation))                                                                                   |
 | AdEMAMix              | *Better, Faster, Older*                                                                                        | [github](https://github.com/nanowell/AdEMAMix-Optimizer-Pytorch)                                               | [paper](https://arxiv.org/abs/2409.03137)([cite](https://github.com/nanowell/AdEMAMix-Optimizer-Pytorch?tab=readme-ov-file#reference))                                                                    |
+| SaRA                  | *High-Efficient Diffusion Model Fine-tuning with Progressive Sparse Low-Rank Adaptation*                        | [github](https://github.com/sjtuplayer/SaRA)                                                                  | [paper](https://arxiv.org/abs/2409.06633)([cite](https://github.com/sjtuplayer/SaRA#citation))                                                                                                               |
 | SOAP                  | *Improving and Stabilizing Shampoo using Adam*                                                                 | [github](https://github.com/nikhilvyas/SOAP)                                                                   | [paper](https://arxiv.org/abs/2409.11321)([cite](https://ui.adsabs.harvard.edu/abs/2024arXiv240911321V/exportcitation))                                                                                   |
 | ADOPT                 | *Modified Adam Can Converge with Any β2 with the Optimal Rate*                                                 | [github](https://github.com/iShohei220/adopt)                                                                  | [paper](https://arxiv.org/abs/2411.02853)([cite](https://github.com/iShohei220/adopt?tab=readme-ov-file#citation))                                                                                        |
 | FTRL                  | *Follow The Regularized Leader*                                                                                |                                                                                                                | [paper](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/41159.pdf)                                                                                                        |
@@ -227,6 +248,7 @@ get_supported_optimizers(['adam*', 'ranger*'])
 | DeMo                  | *Decoupled Momentum Optimization*                                                                              | [github](https://github.com/bloc97/DeMo)                                                                       | [paper](https://arxiv.org/abs/2411.19870)([cite](https://ui.adsabs.harvard.edu/abs/2024arXiv241119870P/exportcitation))                                                                                   |
 | MicroAdam             | *Accurate Adaptive Optimization with Low Space Overhead and Provable Convergence*                              | [github](https://github.com/IST-DASLab/MicroAdam)                                                              | [paper](https://arxiv.org/abs/2405.15593)([cite](https://github.com/IST-DASLab/MicroAdam?tab=readme-ov-file#citing))                                                                                      |
 | Muon                  | *MomentUm Orthogonalized by Newton-schulz*                                                                     | [github](https://github.com/KellerJordan/Muon)                                                                 | [paper](https://x.com/kellerjordan0/status/1842300916864844014)([cite](https://github.com/KellerJordan/Muon))                                                                                             |
+| MuonClip              | *Stable Training with Weight Clipping*                                                                        | [github](https://github.com/MoonshotAI/Kimi-K2)                                                               | [paper](https://arxiv.org/abs/2507.20534)                                                                                                                                                                  |
 | LaProp                | *Separating Momentum and Adaptivity in Adam*                                                                   | [github](https://github.com/Z-T-WANG/LaProp-Optimizer)                                                         | [paper](https://arxiv.org/abs/2002.04839)([cite](https://github.com/Z-T-WANG/LaProp-Optimizer?tab=readme-ov-file#citation))                                                                               |
 | APOLLO                | *SGD-like Memory, AdamW-level Performance*                                                                     | [github](https://github.com/zhuhanqing/APOLLO)                                                                 | [paper](https://arxiv.org/abs/2412.05270)([cite](https://github.com/zhuhanqing/APOLLO?tab=readme-ov-file#-citation))                                                                                      |
 | MARS                  | *Unleashing the Power of Variance Reduction for Training Large Models*                                         | [github](https://github.com/AGI-Arena/MARS)                                                                    | [paper](https://arxiv.org/abs/2411.10438)([cite](https://github.com/AGI-Arena/MARS/tree/main?tab=readme-ov-file#citation))                                                                                |
@@ -257,6 +279,7 @@ get_supported_optimizers(['adam*', 'ranger*'])
 | Refined Schedule-Free | *Through the River: Understanding the Benefit of Schedule-Free Methods for Language Model Training*            |                                                                                                                | [paper](https://arxiv.org/abs/2507.09846)([cite](https://ui.adsabs.harvard.edu/abs/2025arXiv250709846S/exportcitation))                                                                                   |
 | FriendlySAM           | *Friendly Sharpness-Aware Minimization*                                                                        | [github](https://github.com/nblt/F-SAM)                                                                        | [paper](https://openaccess.thecvf.com/content/CVPR2024/papers/Li_Friendly_Sharpness-Aware_Minimization_CVPR_2024_paper.pdf)([cite](https://github.com/nblt/F-SAM?tab=readme-ov-file#citation))            |
 | AdaGO                 | *AdaGrad Meets Muon: Adaptive Stepsizes for Orthogonal Updates*                                                |                                                                                                                | [paper](https://arxiv.org/abs/2509.02981)([cite](https://ui.adsabs.harvard.edu/abs/2025arXiv250902981Z/exportcitation))                                                                                   |
+| NorMuon               | *NorMuon: Making Muon more efficient and scalable*                                                             | [github](https://github.com/zichongli5/NorMuon)                                                                | [paper](https://arxiv.org/abs/2510.05491)([cite](https://ui.adsabs.harvard.edu/abs/2025arXiv251005491L/exportcitation))                                                                                   |
 | Conda                 | *Column-Normalized Adam for Training Large Language Models Faster*                                             | [github](https://github.com/jie040109/Conda)                                                                   | [paper](https://arxiv.org/abs/2509.24218)([cite](https://ui.adsabs.harvard.edu/abs/2025arXiv250924218W/exportcitation))                                                                                   |
 | BCOS                  | *Stochastic Approximation with Block Coordinate Optimal Stepsizes*                                             | [github](https://github.com/facebookresearch/bcos)                                                             | [paper](https://arxiv.org/abs/2507.08963)([cite](https://ui.adsabs.harvard.edu/abs/2025arXiv250708963J/exportcitation))                                                                                   |
 | Cautious WD           | *Cautious Weight Decay*                                                                                        |                                                                                                                | [paper](https://arxiv.org/abs/2510.12402)([cite](https://ui.adsabs.harvard.edu/abs/2025arXiv251012402C/exportcitation))                                                                                   |

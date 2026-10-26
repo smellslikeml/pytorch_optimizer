@@ -208,6 +208,10 @@
     :docstring:
     :members:
 
+::: pytorch_optimizer.DASH
+    :docstring:
+    :members:
+
 ::: pytorch_optimizer.DeMo
     :docstring:
     :members:
@@ -372,7 +376,15 @@
     :docstring:
     :members:
 
+::: pytorch_optimizer.MuonClip
+    :docstring:
+    :members:
+
 ::: pytorch_optimizer.Nero
+    :docstring:
+    :members:
+
+::: pytorch_optimizer.NorMuon
     :docstring:
     :members:
 
@@ -428,10 +440,6 @@
     :docstring:
     :members:
 
-::: pytorch_optimizer.Ranger25
-    :docstring:
-    :members:
-
 ::: pytorch_optimizer.ROSE
     :docstring:
     :members:
@@ -445,6 +453,10 @@
     :members:
 
 ::: pytorch_optimizer.SAM
+    :docstring:
+    :members:
+
+::: pytorch_optimizer.SaRA
     :docstring:
     :members:
 

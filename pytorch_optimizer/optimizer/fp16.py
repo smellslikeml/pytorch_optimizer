@@ -1,35 +1,32 @@
-from typing import Dict, List, Optional, Union, cast
+from typing import cast
 
 import torch
 from torch import nn
 from torch.optim import Optimizer
 
 from pytorch_optimizer.base.type import Closure, ParamsT
-from pytorch_optimizer.optimizer.utils import clip_grad_norm, has_overflow
+from pytorch_optimizer.optimizer.utils.foreach import group_tensors_by_device_and_dtype
+from pytorch_optimizer.optimizer.utils.gradient import clip_grad_norm
+from pytorch_optimizer.optimizer.utils.precision import has_overflow
 
 
 class DynamicLossScaler:
-    """Dynamically adjusts the loss scaling factor.
+    """Adjust the loss scale in response to low precision gradient overflow.
 
-    Dynamic loss scalers are important in mixed-precision training.
-    They help us avoid underflows and overflows in low-precision gradients.
+    Increase the scale after an overflow free window and decrease it when the overflow
+    fraction reaches the tolerance.
 
-    See here for information:
-    <https://docs.nvidia.com/deeplearning/performance/mixed-precision-training/index.html#lossscaling>
-
-    Shamelessly stolen and adapted from FairSeq:
-    <https://github.com/pytorch/fairseq/blob/main/fairseq/optim/fp16_optimizer.py>
-
-    Reference:
-    'https://github.com/facebookresearch/ParlAI/blob/main/parlai/utils/fp16.py'
+    References:
+        - https://docs.nvidia.com/deeplearning/performance/mixed-precision-training/index.html#lossscaling
+        - https://github.com/pytorch/fairseq/blob/main/fairseq/optim/fp16_optimizer.py
+        - https://github.com/facebookresearch/ParlAI/blob/main/parlai/utils/fp16.py
 
     Args:
-        init_scale (float): Initial loss scale.
-        scale_factor (float): Factor by which to increase or decrease loss scale.
-        scale_window (int): If no overflow occurs within scale_window iterations, the loss scale will increase by
-            scale_factor.
-        tolerance (float): Percentage of iterations that may overflow before decreasing the loss scale.
-        threshold (float, optional): Minimum threshold below which the loss scale will not decrease.
+        init_scale: Initial loss scale.
+        scale_factor: Multiplier for increasing or decreasing the scale.
+        scale_window: Number of overflow free iterations between scale increases.
+        tolerance: Fraction of overflowing iterations that triggers a scale decrease.
+        threshold: Optional lower bound for the scale.
 
     """
 
@@ -39,7 +36,7 @@ class DynamicLossScaler:
         scale_factor: float = 2.0,
         scale_window: int = 2000,
         tolerance: float = 0.00,
-        threshold: Optional[float] = None,
+        threshold: float | None = None,
     ):  # fmt: skip
         self.loss_scale = init_scale
         self.scale_factor = scale_factor
@@ -54,12 +51,11 @@ class DynamicLossScaler:
         self.has_overflow_serial: bool = False
 
     def update_scale(self, overflow: bool):
-        r"""Update the loss scale.
+        """Update the loss scale after checking the current gradients.
 
-            If overflow exceeds our tolerance, we decrease the loss scale.
-            If the number of iterations since the last overflow exceeds the scale window, we increase the loss scale.
+        Args:
+            overflow: Whether the current gradients contain NaN or infinite values.
 
-        :param overflow: bool. adjust scales to prevent overflow.
         """
         iter_since_rescale: int = self.iter - self.last_rescale_iter
 
@@ -84,22 +80,22 @@ class DynamicLossScaler:
         self.iter += 1
 
     def decrease_loss_scale(self):
-        r"""Decrease the loss scale by self.scale_factor.
-
-        NOTE: the loss_scale will not go below `self.threshold`.
-        """
+        """Divide the loss scale by `scale_factor`, respecting the optional lower bound."""
         self.loss_scale /= self.scale_factor
         if self.threshold is not None:
             self.loss_scale = max(self.loss_scale, self.threshold)
 
 
 class SafeFP16Optimizer(Optimizer):  # pragma: no cover
-    """Safe FP16 Optimizer.
+    """Wrap an optimizer with float32 master weights and dynamic loss scaling.
+
+    Supports a single parameter group. Use `backward()` to scale the loss and
+    `clip_main_grads()` to check for overflow before updating parameters.
 
     Args:
-        optimizer (Optimizer): Optimizer instance.
-        aggregate_g_norms (bool): Aggregate gradient norms.
-        min_loss_scale (float): Minimum loss scale.
+        optimizer: Base optimizer instance with low precision parameters.
+        aggregate_g_norms: Aggregate squared gradient norms across distributed workers.
+        min_loss_scale: Scale below which persistent overflow raises `FloatingPointError`.
 
     """
 
@@ -128,19 +124,19 @@ class SafeFP16Optimizer(Optimizer):  # pragma: no cover
         self.needs_sync: bool = True
 
     @classmethod
-    def get_parameters(cls, optimizer: Optimizer) -> List:
-        params: List = []
+    def get_parameters(cls, optimizer: Optimizer) -> list:
+        params: list = []
         for group in optimizer.param_groups:
             params += list(group['params'])
         return params
 
     @classmethod
-    def build_fp32_params(cls, parameters: ParamsT, flatten: bool = True) -> Union[torch.Tensor, List[torch.Tensor]]:
-        parameters = cast(List[torch.Tensor], parameters)
+    def build_fp32_params(cls, parameters: ParamsT, flatten: bool = True) -> torch.Tensor | list[torch.Tensor]:
+        parameters = cast(list[torch.Tensor], parameters)
 
         if flatten:
             total_param_size: int = sum(p.numel() for p in parameters)
-            fp32_params = torch.zeros(total_param_size, dtype=torch.float, device=parameters[0].device)  # type: ignore
+            fp32_params = torch.zeros(total_param_size, dtype=torch.float, device=parameters[0].device)
 
             offset: int = 0
             for p in parameters:
@@ -148,50 +144,49 @@ class SafeFP16Optimizer(Optimizer):  # pragma: no cover
                 fp32_params[offset:offset + p_num_el].copy_(p.view(-1))  # fmt: skip
                 offset += p_num_el
 
-            fp32_params = nn.Parameter(fp32_params)  # type: ignore
+            fp32_params = nn.Parameter(fp32_params)
             fp32_params.grad = fp32_params.new(total_param_size)
 
             return fp32_params
 
-        fp32_params: List[torch.Tensor] = []
+        fp32_params: list[torch.Tensor] = []
         for p in parameters:
-            p32 = nn.Parameter(p.float())
-            p32.grad = torch.zeros_like(p32)
+            p32 = nn.Parameter(p.float(), requires_grad=p.requires_grad)
             fp32_params.append(p32)
 
         return fp32_params
 
-    def state_dict(self) -> Dict:
+    def state_dict(self) -> dict:
         """Return the optimizer state dict."""
         state_dict = self.optimizer.state_dict()
+        state_dict['fp32_params'] = [p.detach().clone() for p in self.fp32_params]
         if self.scaler is not None:
             state_dict['loss_scaler'] = self.scaler.loss_scale
         return state_dict
 
-    def load_state_dict(self, state_dict: Dict):
-        """Load an optimizer state dict.
-
-        In general, prefer using the existing optimizer instance's configuration (e.g., learning rate)
-        over the values found in the state_dict. This approach allows resuming training from a checkpoint
-        while applying new optimizer arguments.
+    def load_state_dict(self, state_dict: dict):
+        """Restore the base optimizer state and loss scale from a checkpoint.
 
         Args:
-            state_dict (dict): The state dictionary to load into the optimizer.
+            state_dict: Checkpoint state, including saved parameter group options.
 
         """
         if 'loss_scaler' in state_dict and self.scaler is not None and isinstance(state_dict['loss_scaler'], float):
             self.scaler.loss_scale = state_dict['loss_scaler']
         self.optimizer.load_state_dict(state_dict)
+        if 'fp32_params' in state_dict:
+            if len(state_dict['fp32_params']) != len(self.fp32_params):
+                raise ValueError('master weights do not match the current parameters')
+            with torch.no_grad():
+                for p, saved in zip(self.fp32_params, state_dict['fp32_params']):
+                    p.copy_(saved)
 
     def backward(self, loss, update_main_grads: bool = False):
-        """Compute the sum of gradients of the given tensor w.r.t. graph leaves.
-
-        Compared to :func:`fairseq.optim.FairseqOptimizer.backward`, this function
-        additionally dynamically scales the loss to avoid gradient underflow.
+        """Scale the loss and compute low precision parameter gradients.
 
         Args:
-            loss (float): The loss tensor to backpropagate.
-            update_main_grads (bool): Whether to update the main gradient during backpropagation.
+            loss (torch.Tensor): Scalar loss tensor to backpropagate.
+            update_main_grads: Copy and unscale gradients into the float32 master buffers after backward.
 
         """
         if self.scaler is not None:
@@ -204,37 +199,45 @@ class SafeFP16Optimizer(Optimizer):  # pragma: no cover
             self.update_main_grads()
 
     def sync_fp16_grads_to_fp32(self, multiply_grads: float = 1.0) -> None:
-        """Sync fp16 to fp32 gradients."""
+        """Copy and unscale low precision gradients into float32 master buffers."""
         if self.needs_sync:
             if self.scaler is not None:
                 multiply_grads /= self.scaler.loss_scale
 
-            for p16, p32 in zip(self.fp16_params, self.fp32_params):
-                if not p16.requires_grad:
-                    continue
+            params, grads = [], []
 
-                if p16.grad is not None:
-                    p32.grad.copy_(p16.grad)
-                    p32.grad.mul_(multiply_grads)
+            for p16, p32 in zip(self.fp16_params, self.fp32_params):
+                if p16.requires_grad and p16.grad is not None:
+                    if p32.grad is None:
+                        p32.grad = torch.empty_like(p32)
+
+                    params.append(p32.grad)
+                    grads.append(p16.grad)
                 else:
-                    p32.grad = torch.zeros_like(p16, dtype=torch.float)
+                    p32.grad = None
+
+            for batch in group_tensors_by_device_and_dtype(params, grads):
+                torch._foreach_copy_(batch['params'], batch['grads'])
+                torch._foreach_mul_(batch['params'], multiply_grads)
 
             self.needs_sync = False
 
     def multiply_grads(self, c: float) -> None:
-        """Multiply grads by a constant c."""
+        """Multiply the float32 master gradients by `c`."""
         if self.needs_sync:
             self.sync_fp16_grads_to_fp32(c)
             return
 
-        for p32 in self.fp32_params:
-            p32.grad.mul_(c)
+        grads = [p32.grad for p32 in self.fp32_params if p32.grad is not None]
+
+        for batch in group_tensors_by_device_and_dtype(grads, grads):
+            torch._foreach_mul_(batch['params'], c)
 
     def update_main_grads(self) -> None:
         self.sync_fp16_grads_to_fp32()
 
     def clip_main_grads(self, max_norm: float):
-        """Clip gradient norm and updates dynamic loss scaler."""
+        """Clip master gradients and update the loss scale after checking for overflow."""
         self.sync_fp16_grads_to_fp32()
 
         grad_norm = clip_grad_norm(self.fp32_params, max_norm, sync=self.aggregate_g_norms)
@@ -266,28 +269,30 @@ class SafeFP16Optimizer(Optimizer):  # pragma: no cover
         self.sync_fp16_grads_to_fp32()
         self.optimizer.step(closure)
 
-        for p16, p32 in zip(self.fp16_params, self.fp32_params):
-            if not p16.requires_grad:
-                continue
-            p16.data.copy_(p32)
+        params = [p16.data for p16 in self.fp16_params if p16.requires_grad]
+        masters = [p32 for p16, p32 in zip(self.fp16_params, self.fp32_params) if p16.requires_grad]
+
+        for batch in group_tensors_by_device_and_dtype(params, masters):
+            torch._foreach_copy_(batch['params'], batch['grads'])
 
     def zero_grad(self) -> None:
         """Clear the gradients of all optimized parameters."""
         for p16 in self.fp16_params:
             p16.grad = None
         for p32 in self.fp32_params:
-            p32.grad.zero_()
+            p32.grad = None
         self.needs_sync = False
 
     def get_lr(self) -> float:
-        """Get learning rate."""
-        return self.optimizer.get_lr()
+        """Return the base optimizer learning rate."""
+        return self.optimizer.param_groups[0]['lr']
 
     def set_lr(self, lr: float):
-        """Set learning rate."""
-        self.optimizer.set_lr(lr)
+        """Set the base optimizer learning rate."""
+        for group in self.optimizer.param_groups:
+            group['lr'] = lr
 
     @property
     def loss_scale(self) -> float:
-        """Convenience function which TorchAgent calls to get current scale value."""
+        """Return the current dynamic loss scale."""
         return self.scaler.loss_scale

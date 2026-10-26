@@ -5,29 +5,34 @@ import torch
 from pytorch_optimizer.base.exception import NoComplexParameterError, NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Betas, Closure, Defaults, Loss, ParamGroup, ParamsT
-from pytorch_optimizer.optimizer.galore_utils import PROJECTION_TYPE, GaLoreProjector
+from pytorch_optimizer.optimizer.utils.foreach import group_tensors_by_device_and_dtype
+from pytorch_optimizer.optimizer.utils.galore import PROJECTION_TYPE, GaLoreProjector, update_unprojected_foreach
 
 
 class Conda(BaseOptimizer):
-    """Column-Normalized Adam for Training Large Language Models Faster.
+    """Adam with gradient projection in a basis derived from momentum.
 
     Args:
-        params (ParamsT): Iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): Learning rate.
-        betas (Betas): Coefficients used for computing running averages of gradient and the squared Hessian trace.
-        weight_decay (float): Weight decay (L2 penalty).
-        update_proj_gap (int): Update projection gap.
-        scale (float): Galore projection scaling factor.
-        projection_type (PROJECTION_TYPE): The type of the projection.
-        eps (float): Term added to the denominator to improve numerical stability.
-        maximize (bool): Maximize the objective with respect to the parameters, instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        betas: Decay rates for the first and second moments.
+        weight_decay: Weight decay coefficient.
+        update_proj_gap: Number of steps between low rank projection updates.
+        scale: Scaling factor for the projected update.
+        projection_type: The type of the projection.
+        eps: Term added to the denominator to improve numerical stability.
+        maximize: Maximize the objective instead of minimizing it.
+        foreach: Batch unprojected parameter updates. `None` enables batching for supported groups.
 
     """
+
+    _supports_compiled_foreach = True
+    _step_foreach = staticmethod(update_unprojected_foreach)
 
     def __init__(
         self,
         params: ParamsT,
-        lr: float = 1e-3,
+        lr: float | torch.Tensor = 1e-3,
         betas: Betas = (0.9, 0.999),
         weight_decay: float = 0.0,
         update_proj_gap: int = 2000,
@@ -35,6 +40,7 @@ class Conda(BaseOptimizer):
         projection_type: PROJECTION_TYPE = 'std',
         eps: float = 1e-8,
         maximize: bool = False,
+        foreach: bool | None = None,
         **kwargs,
     ):
         self.validate_learning_rate(lr)
@@ -53,8 +59,10 @@ class Conda(BaseOptimizer):
             'scale': scale,
             'projection_type': projection_type,
             'eps': eps,
+            'foreach': foreach,
             **kwargs,
         }
+
         super().__init__(params, defaults)
 
     def __str__(self) -> str:
@@ -79,7 +87,16 @@ class Conda(BaseOptimizer):
 
             if len(state) == 0:
                 state['exp_avg'] = torch.zeros_like(p)
-                state['exp_avg_sq'] = torch.zeros_like(p)
+
+                shape = list(p.shape)
+                if p.dim() == 2:
+                    rank = min(shape)
+                    if group['projection_type'] in ('left', 'full', 'reverse_std'):
+                        shape[0] = rank
+                    if group['projection_type'] in ('right', 'full', 'reverse_std'):
+                        shape[1] = rank
+
+                state['exp_avg_sq'] = p.new_zeros(shape)
 
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
@@ -99,8 +116,28 @@ class Conda(BaseOptimizer):
 
             step_size: float = group['lr'] * bias_correction2_sq / bias_correction1
 
+            use_foreach = self.can_use_foreach(group, group.get('foreach'))
+
+            if use_foreach:
+                dense_group = {**group, 'params': [p for p in group['params'] if p.dim() != 2]}
+                params, grads, state = self.collect_trainable_params(
+                    dense_group, self.state, ['exp_avg', 'exp_avg_sq']
+                )
+
+                for batch in group_tensors_by_device_and_dtype(params, grads, state):
+                    self._step_foreach(
+                        group,
+                        batch['params'],
+                        batch['grads'],
+                        batch['exp_avg'],
+                        batch['exp_avg_sq'],
+                        step_size,
+                        group['lr'],
+                        self.maximize,
+                    )
+
             for p in group['params']:
-                if p.grad is None:
+                if p.grad is None or (use_foreach and p.dim() != 2):
                     continue
 
                 grad = p.grad
@@ -110,7 +147,7 @@ class Conda(BaseOptimizer):
                 state = self.state[p]
 
                 exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-                exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                exp_avg.lerp_(grad, weight=1.0 - beta1)
 
                 if p.dim() == 2:
                     if 'projector' not in state:
@@ -128,7 +165,8 @@ class Conda(BaseOptimizer):
 
                 de_nom = exp_avg_sq.sqrt().add_(group['eps'])
 
-                norm_grad = exp_avg / de_nom
+                norm_grad = de_nom
+                torch.div(exp_avg, de_nom, out=norm_grad)
 
                 if p.dim() == 2:
                     norm_grad = state['projector'].project_back(norm_grad)

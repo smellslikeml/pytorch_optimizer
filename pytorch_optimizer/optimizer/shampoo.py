@@ -3,29 +3,26 @@ import torch
 from pytorch_optimizer.base.exception import NoComplexParameterError, NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Betas, Closure, Defaults, Loss, ParamGroup, ParamsT
-from pytorch_optimizer.optimizer.shampoo_utils import (
-    LayerWiseGrafting,
-    PreConditioner,
-    PreConditionerType,
-    build_graft,
-    compute_power_svd,
-)
+from pytorch_optimizer.optimizer.utils.graft import LayerWiseGrafting, build_graft
+from pytorch_optimizer.optimizer.utils.matrix import compute_power_svd
+from pytorch_optimizer.optimizer.utils.partition import PreConditionerType
+from pytorch_optimizer.optimizer.utils.preconditioner import PreConditioner
 
 
 class Shampoo(BaseOptimizer):
-    """Preconditioned Stochastic Tensor Optimization.
+    """Stochastic tensor optimization with matrix preconditioning.
 
     Args:
-        params (ParamsT): iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): learning rate.
-        momentum (float): momentum factor.
-        weight_decay (float): weight decay (L2 penalty).
-        weight_decouple (bool): optimizer uses decoupled weight decay as in AdamW.
-        fixed_decay (bool): fix weight decay.
-        preconditioning_compute_steps (int): how often to compute the preconditioner,
-            tuning memory and compute requirements.
-        matrix_eps (float): term added to denominator to improve numerical stability.
-        maximize (bool): maximize the objective instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        momentum: Momentum factor.
+        weight_decay: Weight decay coefficient.
+        weight_decouple: Apply weight decay to parameters instead of adding it to the gradient.
+        fixed_decay: Apply decoupled weight decay without scaling it by the learning rate.
+        preconditioning_compute_steps: How often to compute the preconditioner, tuning memory and compute
+            requirements.
+        matrix_eps: Term added to denominator to improve numerical stability.
+        maximize: Maximize the objective instead of minimizing it.
 
     """
 
@@ -87,7 +84,9 @@ class Shampoo(BaseOptimizer):
                     state['momentum_buffer'] = grad.clone()
 
                 for dim_id, dim in enumerate(grad.size()):
-                    state[f'pre_cond_{dim_id}'] = group['matrix_eps'] * torch.eye(dim, out=grad.new(dim, dim))
+                    state[f'pre_cond_{dim_id}'] = (
+                        torch.eye(dim, device=grad.device).to(grad.dtype).mul_(group['matrix_eps'])
+                    )
                     state[f'inv_pre_cond_{dim_id}'] = grad.new(dim, dim).zero_()
 
     @torch.no_grad()
@@ -114,7 +113,7 @@ class Shampoo(BaseOptimizer):
                 state = self.state[p]
 
                 if momentum > 0.0:
-                    grad.mul_(1.0 - momentum).add_(state['momentum_buffer'], alpha=momentum)
+                    grad.lerp_(state['momentum_buffer'], weight=momentum)
 
                 self.apply_weight_decay(
                     p=p,
@@ -127,8 +126,12 @@ class Shampoo(BaseOptimizer):
 
                 order: int = grad.ndimension()
                 original_size: int = grad.size()
+                statistics_grad = grad
                 for dim_id, dim in enumerate(grad.size()):
                     pre_cond, inv_pre_cond = state[f'pre_cond_{dim_id}'], state[f'inv_pre_cond_{dim_id}']
+
+                    unfolded_grad = statistics_grad.movedim(dim_id, 0).reshape(dim, -1)
+                    pre_cond.addmm_(unfolded_grad, unfolded_grad.t())
 
                     grad = grad.transpose_(0, dim_id).contiguous()
                     transposed_size = grad.size()
@@ -136,7 +139,6 @@ class Shampoo(BaseOptimizer):
                     grad = grad.view(dim, -1)
                     grad_t = grad.t()
 
-                    pre_cond.add_(grad @ grad_t)
                     if group['step'] % self.preconditioning_compute_steps == 0:
                         inv_pre_cond.copy_(compute_power_svd(pre_cond, 2 * order))
 
@@ -155,44 +157,36 @@ class Shampoo(BaseOptimizer):
 
 
 class ScalableShampoo(BaseOptimizer):
-    """Scalable Preconditioned Stochastic Tensor Optimization.
+    """Shampoo with blockwise preconditioning and optional gradient grafting.
 
-    This version of the Scalable Shampoo Optimizer targets single GPU environments,
-    computing pre-conditioners synchronously on GPU (which takes most of the optimization time).
-    It is faster than previous Shampoo implementations by using coupled Newton iteration
-    for matrix inverse powers instead of slow SVD calculations.
+    Compute matrix inverse roots with SVD or coupled Schur-Newton iteration on the
+    parameter device. Grafting uses the update norm of SGD, AdaGrad, or RMSProp.
 
-    Features include:
-    1. Various plug-ins (e.g., gradient grafting, preconditioning types),
-    2. Additional features beyond official PyTorch code,
-    3. Readable and well-organized implementation.
-
-    Reference:
-    https://github.com/google-research/google-research/blob/master/scalable_shampoo/pytorch/shampoo.py
+    Reference: https://github.com/google-research/google-research/blob/master/scalable_shampoo/optax/distributed_shampoo.py
 
     Args:
-        params (ParamsT): iterable or dicts defining parameter groups.
-        lr (float): learning rate.
-        betas (tuple): beta1 and beta2 for momentum.
-        moving_average_for_momentum (bool): whether to perform moving average for momentum (beta1).
-        weight_decay (float): weight decay (L2 penalty).
-        decoupled_weight_decay (bool): use decoupled weight decay.
-        decoupled_learning_rate (bool): use decoupled learning rate, otherwise coupled with preconditioned gradient.
-        inverse_exponent_override (int): fixed exponent for preconditioner if > 0.
-        start_preconditioning_step (int): step to start preconditioning.
-        preconditioning_compute_steps (int): frequency of preconditioner computation.
-        statistics_compute_steps (int): frequency of statistics computation.
-        block_size (int): block size for large layers; 1 means AdaGrad (inefficient).
-        skip_preconditioning_rank_lt (int): skip preconditioning for layers with rank below this.
-        no_preconditioning_for_layers_with_dim_gt (int): avoid preconditioning large layers.
-        shape_interpretation (bool): automatic shape interpretation for tensor dims.
-        graft_type (int): type of grafting (SGD, AdaGrad, RMSProp, etc.).
-        pre_conditioner_type (int): type of preconditioner.
-        nesterov (bool): enable Nesterov momentum.
-        diagonal_eps (float): epsilon for numerical stability in diagonal.
-        matrix_eps (float): epsilon for numerical stability in matrix.
-        use_svd (bool): whether to use SVD for matrix inverse powers (alternative is Schur-Newton).
-        maximize (bool): maximize the objective instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        betas: Decay rates for momentum and preconditioner statistics.
+        moving_average_for_momentum: Whether to perform moving average for momentum (beta1).
+        weight_decay: Weight decay coefficient.
+        decoupled_weight_decay: Use decoupled weight decay.
+        decoupled_learning_rate: Use decoupled learning rate, otherwise coupled with preconditioned gradient.
+        inverse_exponent_override: Fixed exponent for preconditioner if > 0.
+        start_preconditioning_step: Step to start preconditioning.
+        preconditioning_compute_steps: Frequency of preconditioner computation.
+        statistics_compute_steps: Frequency of statistics computation.
+        block_size: Block size for large layers. 1 means AdaGrad (inefficient).
+        skip_preconditioning_rank_lt: Skip preconditioning for layers with rank below this.
+        no_preconditioning_for_layers_with_dim_gt: Avoid preconditioning large layers.
+        shape_interpretation: Automatic shape interpretation for tensor dims.
+        graft_type: Layer wise scale reference from `LayerWiseGrafting`.
+        pre_conditioner_type: Dimensions to precondition, from `PreConditionerType`.
+        nesterov: Use Nesterov momentum.
+        diagonal_eps: Epsilon for numerical stability in diagonal.
+        matrix_eps: Epsilon for numerical stability in matrix.
+        use_svd: Whether to use SVD for matrix inverse powers (alternative is Schur-Newton).
+        maximize: Maximize the objective instead of minimizing it.
 
     """
 
@@ -314,6 +308,8 @@ class ScalableShampoo(BaseOptimizer):
 
             is_precondition_step: bool = self.is_precondition_step(group['step'])
             pre_conditioner_multiplier: float = 1.0 if group['decoupled_learning_rate'] else group['lr']
+            momentum_multiplier: float = group['lr'] if group['decoupled_learning_rate'] else 1.0
+            w: float = (1.0 - beta1) if group['moving_average_for_momentum'] else 1.0
 
             for p in group['params']:
                 if p.grad is None:
@@ -333,9 +329,12 @@ class ScalableShampoo(BaseOptimizer):
                 if group['step'] % self.preconditioning_compute_steps == 0:
                     pre_conditioner.compute_pre_conditioners()
 
-                graft_grad: torch.Tensor = graft.precondition_gradient(grad * pre_conditioner_multiplier)
-                shampoo_grad: torch.Tensor = (
-                    pre_conditioner.preconditioned_grad(grad) if is_precondition_step else grad
+                graft_grad: torch.Tensor = graft.precondition_gradient(grad).mul(pre_conditioner_multiplier)
+                shampoo_grad: torch.Tensor = pre_conditioner.preconditioned_grad(grad)
+                shampoo_grad = (
+                    shampoo_grad.mul(pre_conditioner_multiplier)
+                    if len(pre_conditioner.pre_conditioners) > 0
+                    else graft_grad.clone()
                 )
 
                 if self.graft_type != LayerWiseGrafting.NONE:
@@ -344,29 +343,42 @@ class ScalableShampoo(BaseOptimizer):
 
                     shampoo_grad.mul_(graft_norm / (shampoo_norm + 1e-16))
 
-                for g in (graft_grad, shampoo_grad):
+                if group['decoupled_weight_decay']:
                     self.apply_weight_decay(
                         p,
-                        grad=g,
+                        grad=None,
                         lr=group['lr'],
                         weight_decay=group['weight_decay'],
-                        weight_decouple=group['decoupled_weight_decay'],
+                        weight_decouple=True,
                         fixed_decay=False,
                     )
+                else:
+                    for g in (graft_grad, shampoo_grad):
+                        self.apply_weight_decay(
+                            p,
+                            grad=g,
+                            lr=group['lr'],
+                            weight_decay=group['weight_decay'],
+                            weight_decouple=False,
+                            fixed_decay=False,
+                        )
 
-                state['momentum'].mul_(beta1).add_(shampoo_grad)
-                graft_momentum = graft.update_momentum(grad, beta1)
+                if group['moving_average_for_momentum']:
+                    state['momentum'].lerp_(shampoo_grad, weight=w)
+                else:
+                    state['momentum'].mul_(beta1).add_(shampoo_grad)
+
+                graft_momentum = graft.update_momentum(graft_grad, beta1, w)
 
                 momentum_update = state['momentum'] if is_precondition_step else graft_momentum
 
                 if group['nesterov']:
-                    w: float = (1.0 - beta1) if group['moving_average_for_momentum'] else 1.0
-
                     wd_update = shampoo_grad if is_precondition_step else graft_grad
-                    wd_update.mul_(w)
+                    if group['moving_average_for_momentum']:
+                        momentum_update = momentum_update.lerp(wd_update, weight=w)
+                    else:
+                        momentum_update = momentum_update.mul(beta1).add_(wd_update)
 
-                    momentum_update.mul_(beta1).add_(wd_update)
-
-                p.add_(momentum_update, alpha=-group['lr'])
+                p.add_(momentum_update, alpha=-momentum_multiplier)
 
         return loss

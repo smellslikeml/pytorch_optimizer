@@ -1,12 +1,15 @@
 import fnmatch
+from collections.abc import Callable, Sequence
 from importlib.util import find_spec
-from typing import Dict, List, Optional, Sequence, Set, Union
+from types import MethodType
+from typing import cast
 from warnings import warn
 
 import torch
 from torch import nn
 from torch.optim import LBFGS, SGD, Adam, AdamW, NAdam, Optimizer, RMSprop
 
+from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import OptimizerType, ParamsT
 from pytorch_optimizer.optimizer.a2grad import A2Grad
 from pytorch_optimizer.optimizer.adabelief import AdaBelief
@@ -44,12 +47,12 @@ from pytorch_optimizer.optimizer.bcos import BCOS
 from pytorch_optimizer.optimizer.came import CAME
 from pytorch_optimizer.optimizer.conda import Conda
 from pytorch_optimizer.optimizer.dadapt import DAdaptAdaGrad, DAdaptAdam, DAdaptAdan, DAdaptLion, DAdaptSGD
+from pytorch_optimizer.optimizer.dash import DASH
 from pytorch_optimizer.optimizer.demo import DeMo
 from pytorch_optimizer.optimizer.diffgrad import DiffGrad
 from pytorch_optimizer.optimizer.dual_adam import DualAdam
 from pytorch_optimizer.optimizer.emonavi import EmoFact, EmoLynx, EmoNavi
 from pytorch_optimizer.optimizer.exadam import EXAdam
-from pytorch_optimizer.optimizer.experimental.ranger25 import Ranger25
 from pytorch_optimizer.optimizer.fadam import FAdam
 from pytorch_optimizer.optimizer.fira import Fira
 from pytorch_optimizer.optimizer.flash_adamw import FlashAdamW
@@ -74,7 +77,15 @@ from pytorch_optimizer.optimizer.madgrad import MADGRAD
 from pytorch_optimizer.optimizer.magma import Magma
 from pytorch_optimizer.optimizer.mars import MARS
 from pytorch_optimizer.optimizer.msvag import MSVAG
-from pytorch_optimizer.optimizer.muon import AdaGO, AdaMuon, DistributedMuon, Muon, prepare_muon_parameters
+from pytorch_optimizer.optimizer.muon import (
+    AdaGO,
+    AdaMuon,
+    DistributedMuon,
+    Muon,
+    MuonClip,
+    NorMuon,
+    prepare_muon_parameters,
+)
 from pytorch_optimizer.optimizer.nero import Nero
 from pytorch_optimizer.optimizer.novograd import NovoGrad
 from pytorch_optimizer.optimizer.orthograd import OrthoGrad
@@ -93,6 +104,7 @@ from pytorch_optimizer.optimizer.ranger21 import Ranger21
 from pytorch_optimizer.optimizer.rose import ROSE
 from pytorch_optimizer.optimizer.rotograd import RotoGrad
 from pytorch_optimizer.optimizer.sam import BSAM, GSAM, SAM, WSAM, FriendlySAM, LookSAM
+from pytorch_optimizer.optimizer.sara import SaRA
 from pytorch_optimizer.optimizer.schedulefree import (
     ScheduleFreeAdamW,
     ScheduleFreeRAdam,
@@ -116,11 +128,164 @@ from pytorch_optimizer.optimizer.tiger import Tiger
 from pytorch_optimizer.optimizer.trac import TRAC
 from pytorch_optimizer.optimizer.yogi import Yogi
 
+__all__ = [
+    'ADOPT',
+    'APOLLO',
+    'ASGD',
+    'BCOS',
+    'BSAM',
+    'CAME',
+    'DASH',
+    'FOCUS',
+    'FTRL',
+    'GSAM',
+    'LARS',
+    'LBFGS',
+    'LOMO',
+    'MADGRAD',
+    'MARS',
+    'MSVAG',
+    'PID',
+    'PNM',
+    'QHM',
+    'RACS',
+    'ROSE',
+    'SAM',
+    'SCION',
+    'SGD',
+    'SGDP',
+    'SGDW',
+    'SM3',
+    'SOAP',
+    'SPAM',
+    'SRMM',
+    'SWATS',
+    'TAM',
+    'TRAC',
+    'VSGD',
+    'WSAM',
+    'A2Grad',
+    'AccSGD',
+    'AdEMAMix',
+    'AdaBelief',
+    'AdaBound',
+    'AdaDelta',
+    'AdaFactor',
+    'AdaGC',
+    'AdaGO',
+    'AdaHessian',
+    'AdaLOMO',
+    'AdaMax',
+    'AdaMod',
+    'AdaMuon',
+    'AdaNorm',
+    'AdaPNM',
+    'AdaShift',
+    'AdaSmooth',
+    'AdaTAM',
+    'Adai',
+    'Adalite',
+    'Adam',
+    'AdamC',
+    'AdamG',
+    'AdamMini',
+    'AdamP',
+    'AdamS',
+    'AdamW',
+    'AdamWSN',
+    'Adan',
+    'AggMo',
+    'Aida',
+    'AliG',
+    'Alice',
+    'Amos',
+    'Ano',
+    'ApolloDQN',
+    'AvaGrad',
+    'Conda',
+    'DAdaptAdaGrad',
+    'DAdaptAdam',
+    'DAdaptAdan',
+    'DAdaptLion',
+    'DAdaptSGD',
+    'DeMo',
+    'DiffGrad',
+    'DistributedMuon',
+    'DualAdam',
+    'DynamicLossScaler',
+    'EXAdam',
+    'EmoFact',
+    'EmoLynx',
+    'EmoNavi',
+    'FAdam',
+    'Fira',
+    'FlashAdamW',
+    'FriendlySAM',
+    'Fromage',
+    'GaLore',
+    'Grams',
+    'Gravity',
+    'GrokFastAdamW',
+    'Kate',
+    'Kron',
+    'LaProp',
+    'Lamb',
+    'Lion',
+    'LoRARite',
+    'LookSAM',
+    'Lookahead',
+    'Magma',
+    'Muon',
+    'MuonClip',
+    'NAdam',
+    'Nero',
+    'NorMuon',
+    'NovoGrad',
+    'OrthoGrad',
+    'PAdam',
+    'PCGrad',
+    'Prodigy',
+    'QHAdam',
+    'RAdam',
+    'RMSprop',
+    'Ranger',
+    'Ranger21',
+    'RotoGrad',
+    'SCIONLight',
+    'SGDSaI',
+    'SPlus',
+    'SaRA',
+    'SafeFP16Optimizer',
+    'ScalableShampoo',
+    'ScheduleFreeAdamW',
+    'ScheduleFreeRAdam',
+    'ScheduleFreeSGD',
+    'ScheduleFreeWrapper',
+    'Shampoo',
+    'SignSGD',
+    'SimplifiedAdEMAMix',
+    'SophiaH',
+    'SpectralSphere',
+    'StableAdamW',
+    'StableSPAM',
+    'Tiger',
+    'Yogi',
+    'agc',
+    'centralize_gradient',
+    'create_optimizer',
+    'get_optimizer_parameters',
+    'get_supported_optimizers',
+    'load_ao_optimizer',
+    'load_bnb_optimizer',
+    'load_optimizer',
+    'load_q_galore_optimizer',
+]
+
 HAS_BNB: bool = find_spec('bitsandbytes') is not None
-HAS_Q_GALORE: bool = find_spec('q-galore-torch') is not None
+HAS_Q_GALORE: bool = find_spec('q_galore_torch') is not None
 HAS_TORCHAO: bool = find_spec('torchao') is not None
 
-OPTIMIZER_LIST: List[OptimizerType] = [
+OPTIMIZER_LIST: list[OptimizerType] = [
     LBFGS,
     SGD,
     Adam,
@@ -170,6 +335,7 @@ OPTIMIZER_LIST: List[OptimizerType] = [
     BSAM,
     CAME,
     Conda,
+    DASH,
     DAdaptAdaGrad,
     DAdaptAdam,
     DAdaptAdan,
@@ -206,7 +372,9 @@ OPTIMIZER_LIST: List[OptimizerType] = [
     MARS,
     MSVAG,
     Muon,
+    MuonClip,
     Nero,
+    NorMuon,
     NovoGrad,
     PAdam,
     PID,
@@ -218,7 +386,6 @@ OPTIMIZER_LIST: List[OptimizerType] = [
     RAdam,
     Ranger,
     Ranger21,
-    Ranger25,
     ROSE,
     SCION,
     SCIONLight,
@@ -231,6 +398,7 @@ OPTIMIZER_LIST: List[OptimizerType] = [
     SPlus,
     SRMM,
     SWATS,
+    SaRA,
     ScalableShampoo,
     ScheduleFreeAdamW,
     ScheduleFreeRAdam,
@@ -247,7 +415,7 @@ OPTIMIZER_LIST: List[OptimizerType] = [
     Yogi,
     SpectralSphere,
 ]
-OPTIMIZERS: Dict[str, OptimizerType] = {str(optimizer.__name__).lower(): optimizer for optimizer in OPTIMIZER_LIST}
+OPTIMIZERS: dict[str, OptimizerType] = {str(optimizer.__name__).lower(): optimizer for optimizer in OPTIMIZER_LIST}
 
 BNB_OPTIMIZERS = (
     ('paged_ademamix8bit', 'PagedAdEMAMix8bit'),
@@ -278,7 +446,18 @@ BNB_OPTIMIZERS = (
 
 
 def load_bnb_optimizer(optimizer: str) -> OptimizerType:  # pragma: no cover
-    """Load bnb optimizer instance."""
+    """Return an optimizer class from bitsandbytes.
+
+    Args:
+        optimizer: Lowercase optimizer name, including the integration prefix.
+
+    Returns:
+        OptimizerType: Optimizer class from the optional integration.
+
+    Raises:
+        NotImplementedError: The optimizer name is unsupported.
+
+    """
     from bitsandbytes import optim  # noqa: PLC0415
 
     for name, cls_name in BNB_OPTIMIZERS:
@@ -289,7 +468,18 @@ def load_bnb_optimizer(optimizer: str) -> OptimizerType:  # pragma: no cover
 
 
 def load_q_galore_optimizer(optimizer: str) -> OptimizerType:  # pragma: no cover
-    """Load Q-GaLore optimizer instance."""
+    """Return an optimizer class from Q-GaLore.
+
+    Args:
+        optimizer: Lowercase optimizer name, including the integration prefix.
+
+    Returns:
+        OptimizerType: Optimizer class from the optional integration.
+
+    Raises:
+        NotImplementedError: The optimizer name is unsupported.
+
+    """
     import q_galore_torch  # noqa: PLC0415
 
     if 'adamw8bit' in optimizer:
@@ -299,7 +489,18 @@ def load_q_galore_optimizer(optimizer: str) -> OptimizerType:  # pragma: no cove
 
 
 def load_ao_optimizer(optimizer: str) -> OptimizerType:  # pragma: no cover
-    """Load TorchAO optimizer instance."""
+    """Return an optimizer class from TorchAO.
+
+    Args:
+        optimizer: Lowercase optimizer name, including the integration prefix.
+
+    Returns:
+        OptimizerType: Optimizer class from the optional integration.
+
+    Raises:
+        NotImplementedError: The optimizer name is unsupported.
+
+    """
     from torchao.prototype import low_bit_optim  # noqa: PLC0415
 
     if 'adamw8bit' in optimizer:
@@ -313,7 +514,22 @@ def load_ao_optimizer(optimizer: str) -> OptimizerType:  # pragma: no cover
 
 
 def load_optimizer(optimizer: str) -> OptimizerType:
-    """Load optimizers."""
+    """Return an optimizer class by name.
+
+    Names are case insensitive. Use the `bnb`, `q_galore`, or `torchao` prefix for
+    optional integrations, which require their dependencies and CUDA.
+
+    Args:
+        optimizer: Registered optimizer name.
+
+    Returns:
+        OptimizerType: Optimizer class to instantiate with parameters and options.
+
+    Raises:
+        ImportError: An optional integration or CUDA is unavailable.
+        NotImplementedError: The optimizer name is unsupported.
+
+    """
     optimizer_name: str = optimizer.lower()
 
     if optimizer_name.startswith('bnb'):
@@ -340,42 +556,70 @@ def load_optimizer(optimizer: str) -> OptimizerType:
 def create_optimizer(
     model: nn.Module,
     optimizer_name: str,
-    lr: float = 1e-3,
+    lr: float | torch.Tensor = 1e-3,
     weight_decay: float = 0.0,
-    wd_ban_list: List[str] = ('bias', 'LayerNorm.bias', 'LayerNorm.weight'),
+    wd_ban_list: Sequence[str] = ('bias', 'LayerNorm.bias', 'LayerNorm.weight'),
     use_lookahead: bool = False,
     use_orthograd: bool = False,
+    compile: bool = False,  # noqa: A002
+    compile_kwargs: dict | None = None,
     **kwargs,
 ) -> Optimizer:
-    r"""Build optimizer.
+    """Create an optimizer for a model with optional wrappers and compilation.
 
     Args:
-        model (nn.Module): model.
-        optimizer_name (str): optimizer name.
-        lr (float): learning rate.
-        weight_decay (float): weight decay.
-        wd_ban_list (List[str]): weight decay ban list by layer.
-        use_lookahead (bool): use Lookahead.
-        use_orthograd (bool): use OrthoGrad.
-        **kwargs (dict): optimizer parameters.
+        model: Model whose parameters to optimize.
+        optimizer_name: Case insensitive name accepted by `load_optimizer()`.
+        lr: Learning rate. Compiled updates use scalar tensors on the parameter device.
+        weight_decay: Weight decay coefficient.
+        wd_ban_list: Name patterns to exclude from weight decay. Matches parameter names and module class names.
+        use_lookahead: Wrap the optimizer with Lookahead, unless it already includes Lookahead.
+        use_orthograd: Project gradients with OrthoGrad before each update.
+        compile: Compile optimizer updates with `torch.compile`. Supported foreach paths keep scalar bookkeeping eager.
+        compile_kwargs: Options for `torch.compile`. Dynamic tracing defaults to `True`.
+        **kwargs (dict): Optimizer and wrapper options.
+
+    Returns:
+        Optimizer: Configured optimizer instance.
 
     """
     optimizer_name = optimizer_name.lower()
+    optimizer_type = load_optimizer(optimizer_name)
 
-    parameters = (
-        get_optimizer_parameters(model, weight_decay, wd_ban_list) if weight_decay > 0.0 else model.parameters()
+    use_compiled_foreach = (
+        compile
+        and issubclass(optimizer_type, BaseOptimizer)
+        and optimizer_type._supports_compiled_foreach
+        and kwargs.get('foreach') is not False
+        and not use_orthograd
+        and not use_lookahead
     )
 
-    optimizer_class: OptimizerType = load_optimizer(optimizer_name)
+    if use_compiled_foreach:
+        kwargs.setdefault('foreach', True)
+
+    if compile and not use_compiled_foreach and not isinstance(lr, torch.Tensor):
+        lr = torch.tensor(lr, device=next(model.parameters()).device)
+
+    if optimizer_name != 'lbfgs':
+        kwargs['weight_decay'] = weight_decay
+
+    parameters = (
+        get_optimizer_parameters(model, weight_decay, wd_ban_list)
+        if weight_decay > 0.0
+        else [{'params': model.parameters(), 'weight_decay': weight_decay}]
+    )
+
+    optimizer_class = cast(Callable[..., Optimizer], optimizer_type)
 
     if optimizer_name == 'alig':
         optimizer = optimizer_class(parameters, max_lr=lr, **kwargs)
     elif optimizer_name in ('lomo', 'adalomo', 'adammini'):
         optimizer = optimizer_class(model, lr=lr, **kwargs)
-    elif optimizer_name in ('muon', 'adamuon', 'adago'):
+    elif optimizer_name in ('muon', 'muonclip', 'adamuon', 'adago', 'normuon'):
         warn(f'highly recommend you to manually create the {optimizer_name} manually.', UserWarning, stacklevel=1)
 
-        optimizer = prepare_muon_parameters(model, optimizer_name, lr=lr, weight_decay=weight_decay, **kwargs)
+        optimizer = prepare_muon_parameters(model, optimizer_name, lr=lr, **kwargs)
     else:
         optimizer = optimizer_class(parameters, lr=lr, **kwargs)
 
@@ -383,60 +627,72 @@ def create_optimizer(
         optimizer = OrthoGrad(optimizer, **kwargs)
 
     if use_lookahead:
-        if optimizer_name in ('ranger', 'ranger21', 'ranger25'):
+        if optimizer_name in ('ranger', 'ranger21'):
             warn(f'{optimizer} already has a Lookahead variant.', UserWarning, stacklevel=1)
-            return optimizer
+        else:
+            optimizer = Lookahead(
+                optimizer,
+                k=kwargs.get('k', 5),
+                alpha=kwargs.get('alpha', 0.5),
+                pullback_momentum=kwargs.get('pullback_momentum', 'none'),
+            )
 
-        optimizer = Lookahead(
+    if use_compiled_foreach and isinstance(optimizer, BaseOptimizer):
+        optimizer._compile_foreach(compile_kwargs)
+    elif compile:
+        optimizer.step = MethodType(  # ty: ignore[invalid-assignment]
+            torch.compile(optimizer.step.__func__, **{'dynamic': True, **(compile_kwargs or {})}),
             optimizer,
-            k=kwargs.get('k', 5),
-            alpha=kwargs.get('alpha', 0.5),
-            pullback_momentum=kwargs.get('pullback_momentum', 'none'),
         )
 
     return optimizer
 
 
 def get_optimizer_parameters(
-    model_or_parameter: Union[nn.Module, List],
+    model_or_parameter: nn.Module | list,
     weight_decay: float,
-    wd_ban_list: List[str] = ('bias', 'LayerNorm.bias', 'LayerNorm.weight'),
+    wd_ban_list: Sequence[str] = ('bias', 'LayerNorm.bias', 'LayerNorm.weight'),
 ) -> ParamsT:
-    r"""Get optimizer parameters while filtering specified modules.
+    """Group trainable parameters by whether to apply weight decay.
 
-    Notice that, You can also ban by a module name level (e.g. LayerNorm) if you pass nn.Module instance.
-    You just only need to input `LayerNorm` to exclude weight decay from the layer norm layer(s).
+    With a model, patterns match parameter names and module class names. For example,
+    `LayerNorm` excludes all parameters of LayerNorm modules. With named parameters,
+    patterns match parameter names only.
 
     Args:
-        model_or_parameter (Union[nn.Module, List]): model or parameters.
-        weight_decay (float): weight decay.
-        wd_ban_list (List[str]): weight decay ban list.
+        model_or_parameter: Model or list of `(name, parameter)` pairs.
+        weight_decay: Weight decay coefficient for parameters outside the ban list.
+        wd_ban_list: Substrings identifying parameters to exclude from weight decay.
 
     Returns:
-        ParamsT: optimizer parameters.
+        ParamsT: Nonempty parameter groups with the requested weight decay or zero weight decay.
 
     """
-    banned_parameter_patterns: Set[str] = set()
+    banned_parameter_ids: set[int] = set()
 
     if isinstance(model_or_parameter, nn.Module):
         for module_name, module in model_or_parameter.named_modules():
-            for param_name, _ in module.named_parameters(recurse=False):
+            for param_name, param in module.named_parameters(recurse=False):
                 full_param_name: str = f'{module_name}.{param_name}' if module_name else param_name
                 if any(
-                    banned in pattern for banned in wd_ban_list for pattern in (full_param_name, module._get_name())
+                    banned in pattern
+                    for banned in wd_ban_list
+                    for pattern in (full_param_name, module._get_name(), f'{module._get_name()}.{param_name}')
                 ):
-                    banned_parameter_patterns.add(full_param_name)
+                    banned_parameter_ids.add(id(param))
 
         model_or_parameter = list(model_or_parameter.named_parameters())
     else:
-        banned_parameter_patterns.update(wd_ban_list)
+        banned_parameter_ids.update(
+            id(p) for n, p in model_or_parameter if any(pattern in n for pattern in wd_ban_list)
+        )
 
-    return [
+    groups = [
         {
             'params': [
                 p
                 for n, p in model_or_parameter
-                if p.requires_grad and not any(nd in n for nd in banned_parameter_patterns)
+                if p.requires_grad and id(p) not in banned_parameter_ids
             ],
             'weight_decay': weight_decay,
         },
@@ -444,19 +700,22 @@ def get_optimizer_parameters(
             'params': [
                 p
                 for n, p in model_or_parameter
-                if p.requires_grad and any(nd in n for nd in banned_parameter_patterns)
+                if p.requires_grad and id(p) in banned_parameter_ids
             ],
             'weight_decay': 0.0,
         },
     ]
+    return [group for group in groups if group['params']]
 
 
-def get_supported_optimizers(filters: Optional[Union[str, List[str]]] = None) -> List[str]:
-    r"""Return list of available optimizer names, sorted alphabetically.
+def get_supported_optimizers(filters: str | list[str] | None = None) -> list[str]:
+    """List registered optimizer names in alphabetical order.
 
     Args:
-        filters (Optional[Union[str, List[str]]]): wildcard filter string that works with fmatch.
-            if None, it will return the whole list.
+        filters: Wildcard pattern or list of patterns, such as `'*adam*'`. `None` selects all names.
+
+    Returns:
+        list[str]: Matching names in lowercase, without duplicates.
 
     """
     if filters is None:
@@ -464,7 +723,7 @@ def get_supported_optimizers(filters: Optional[Union[str, List[str]]] = None) ->
 
     include_filters: Sequence[str] = filters if isinstance(filters, (tuple, list)) else [filters]
 
-    filtered_list: Set[str] = set()
+    filtered_list: set[str] = set()
     for include_filter in include_filters:
         filtered_list.update(fnmatch.filter(OPTIMIZERS.keys(), include_filter))
 

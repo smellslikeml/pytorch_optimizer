@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Union
+from collections import defaultdict
 
 import torch
 from torch.nn.functional import normalize
@@ -6,11 +6,21 @@ from torch.nn.functional import normalize
 from pytorch_optimizer.base.exception import NoComplexParameterError, NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Closure, Loss, ParamGroup, ParamsT
+from pytorch_optimizer.optimizer.utils.foreach import group_tensors_by_device_and_dtype
 
 
 @torch.no_grad()
-def power_iteration(w: torch.Tensor, steps: int = 50) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Leading singular triplet (sigma, u, v) via bilateral power iteration (fp32/bf16)."""
+def power_iteration(w: torch.Tensor, steps: int = 50) -> tuple[torch.Tensor, torch.Tensor]:
+    """Estimate the leading left and right singular vectors with bilateral power iteration.
+
+    Args:
+        w: Weight matrix or batch of matrices.
+        steps: Number of power iterations, computed in bfloat16.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Left and right singular vector estimates, as column vectors.
+
+    """
     w = w.to(torch.bfloat16)
     v = torch.ones_like(w[..., :1, :].transpose(-2, -1))
 
@@ -24,7 +34,7 @@ def power_iteration(w: torch.Tensor, steps: int = 50) -> Tuple[torch.Tensor, tor
 
 @torch.no_grad()
 def msign(x: torch.Tensor, steps: int) -> torch.Tensor:
-    """Matrix sign via Newton-Schulz with Polar-Express coefficients."""
+    """Approximate the matrix polar factor with Polar Express Newton-Schulz iterations."""
     transpose: bool = x.size(-2) > x.size(-1)
 
     x = x.mT if transpose else x
@@ -47,8 +57,13 @@ def msign(x: torch.Tensor, steps: int) -> torch.Tensor:
         coef_a, coef_b, coef_c = coefficients[i] if i < 8 else coefficients[-1]
 
         a = x @ x.mT
-        b = torch.addmm(a, a, a, alpha=coef_c, beta=coef_b)
-        x = torch.addmm(x, b, x, alpha=1.0, beta=coef_a)
+
+        if x.ndim == 2:
+            b = torch.addmm(a, a, a, alpha=coef_c, beta=coef_b)
+            x = torch.addmm(x, b, x, alpha=1.0, beta=coef_a)
+        else:
+            b = torch.baddbmm(a, a, a, alpha=coef_c, beta=coef_b)
+            x = torch.baddbmm(x, b, x, alpha=1.0, beta=coef_a)
 
     return x.mT if transpose else x
 
@@ -57,10 +72,21 @@ def msign(x: torch.Tensor, steps: int) -> torch.Tensor:
 def compute_f_tensor(
     x: torch.Tensor,
     theta: torch.Tensor,
-    lambda_value: Union[torch.Tensor, float],
+    lambda_value: torch.Tensor | float,
     msign_steps: int = 8,
 ) -> torch.Tensor:
-    """f(lambda) = <Θ, msign(G + lambdaΘ)>. Returns 0-d tensor (no GPU sync)."""
+    """Compute the scalar constraint residual for a spectral update.
+
+    Args:
+        x: Normalized momentum matrix.
+        theta: Outer product of the leading left and right singular vectors.
+        lambda_value: Lagrange multiplier for the constraint.
+        msign_steps: Number of matrix polar factor iterations.
+
+    Returns:
+        torch.Tensor: Scalar inner product of `theta` and `msign(x + lambda_value * theta)`.
+
+    """
     z: torch.Tensor = x + lambda_value * theta
     phi: torch.Tensor = msign(z, steps=msign_steps)
     return (theta * phi).sum()
@@ -75,7 +101,7 @@ def find_bracket(
     max_expansions: int = 10,
     msign_steps: int = 8,
     tolerance_f: float = 1e-8,
-) -> Tuple[Optional[float], Optional[float], torch.Tensor, torch.Tensor]:
+) -> tuple[float | None, float | None, torch.Tensor, torch.Tensor]:
     """Find lambda_l < lambda_r such that: f(lambda_l) <= 0 <= f(lambda_r) with f monotone increasing.
 
     If f(initial_guess) is already near zero, returns a degenerate bracket.
@@ -175,6 +201,64 @@ def solve_lambda_with_bisection(
     return best_lambda
 
 
+def solve_lambda_foreach(
+    x: torch.Tensor, theta: torch.Tensor, msign_steps: int, tolerance: float, max_iterations: int
+) -> torch.Tensor:
+    """Solve independent spectral constraints for a batch of matrices."""
+
+    def evaluate(value):
+        scaled_theta = (value[:, None, None] * theta).to(theta.dtype)
+        return (theta * msign(x + scaled_theta, msign_steps)).sum(dim=(-2, -1))
+
+    previous = x.new_zeros(x.size(0))
+    previous_f = evaluate(previous)
+
+    step = torch.where(previous_f < 0, 1e-3, -1e-3)
+    found = previous_f.abs() < tolerance
+    left, right = previous.clone(), previous.clone()
+    left_f, right_f = previous_f.clone(), previous_f.clone()
+
+    for _ in range(10):
+        if found.all():
+            break
+
+        current = previous + step
+        current_f = evaluate(current)
+        crossing = ~found & ((previous_f <= 0) != (current_f <= 0))
+        ascending = previous_f <= 0
+
+        left = torch.where(crossing, torch.where(ascending, previous, current), left)
+        right = torch.where(crossing, torch.where(ascending, current, previous), right)
+        left_f = torch.where(crossing, torch.where(ascending, previous_f, current_f), left_f)
+        right_f = torch.where(crossing, torch.where(ascending, current_f, previous_f), right_f)
+
+        found |= crossing
+        previous, previous_f = current, current_f
+        step = step * 2.0
+
+    use_left = left_f.abs() < right_f.abs()
+    best = torch.where(use_left, left, right)
+    best_f = torch.where(use_left, left_f, right_f)
+    active = found & (best_f.abs() > tolerance)
+
+    for _ in range(max_iterations):
+        if not active.any():
+            break
+
+        middle = (left + right) * 0.5
+        middle_f = evaluate(middle)
+
+        improved = active & (middle_f.abs() < best_f.abs())
+        best = torch.where(improved, middle, best)
+        best_f = torch.where(improved, middle_f, best_f)
+
+        active &= middle_f.abs() > tolerance
+        left = torch.where(active & (middle_f < 0), middle, left)
+        right = torch.where(active & (middle_f >= 0), middle, right)
+
+    return best
+
+
 def compute_spectral_ball_update(
     weight: torch.Tensor,
     momentum: torch.Tensor,
@@ -183,33 +267,21 @@ def compute_spectral_ball_update(
     solver_tolerance_f: float,
     solver_max_iterations: int,
 ) -> torch.Tensor:
-    """Compute spectral ball constrained update direction (dispatcher).
+    """Compute a momentum update tangent to the weight's leading singular direction.
 
-    This is the main entry point that dispatches to either single-rank or
-    tensor-parallel implementations based on the TP configuration.
-
-    Algorithm overview:
-    1. Power iteration to get sigma, u, v
-    2. Retract W to spectral sphere: W ← (R / sigma)W
-    3. Form Θ = uv^T
-    4. Solve for lambda: <Θ, msign(M + lambdaΘ)> = 0
-    5. Return Φ = msign(M + lambdaΘ)
-
-    The msign function uses Polar-Express coefficients for fast convergence.
+    Normalize momentum, estimate the weight's leading singular vectors, and solve for
+    a multiplier that makes the polar factor update orthogonal to their outer product.
 
     Args:
-        weight: Current weight matrix (modified in-place for retraction)
-        momentum: Momentum tensor
-        power_iteration_steps: Number of power iteration steps
-        msign_steps: Number of Newton-Schulz iterations (uses Polar-Express coefficients)
-        solver_tolerance_f: Function tolerance for solver
-        solver_max_iterations: Maximum solver iterations
+        weight: Current 2D weight matrix.
+        momentum: Momentum tensor with the same shape as `weight`.
+        power_iteration_steps: Iterations for estimating the singular vectors.
+        msign_steps: Newton-Schulz iterations for the matrix polar factor.
+        solver_tolerance_f: Residual threshold for the multiplier solver.
+        solver_max_iterations: Maximum bisection iterations.
 
     Returns:
-        Update direction Φ to be applied as W ← W - lr * Φ, retraction bias, and current spectral norm sigma.
-
-    Note:
-        W is modified in-place during the retraction step.
+        torch.Tensor: Update direction with the same shape as `weight`, in bfloat16.
 
     """
     momentum_fp32 = momentum.to(torch.float32)
@@ -236,50 +308,28 @@ def compute_spectral_ball_update(
 
 
 class SpectralSphere(BaseOptimizer):
-    """Controlled LLM Training on Spectral Sphere.
+    """Matrix updates with a spectral tangent constraint.
 
-    This optimizer constrains weight matrices to lie on a spectral sphere of fixed radius R,
-    where ||W||_2 = R. The optimization proceeds by:
-
-    1. Power iteration to compute spectral norm sigma and top singular vectors (u, v)
-    2. Retraction to spectral sphere: W ← (R / sigma) * W
-    3. Form Θ = u @ v^T
-    4. Solve for Lagrange multiplier lambda: <Θ, msign(M + lambdaΘ)> = 0
-    5. Compute update direction: Φ = msign(M + lambdaΘ)
-    6. Update: W ← W - lr * Φ
-
-    The key insight is that the retraction step at the end of iteration t is equivalent to
-    the retraction at the beginning of iteration t+1. This allows us to unify the power
-    iteration for both retraction and Theta computation in a single efficient step.
+    Supports dense, real 2D parameters. Uses the leading singular vectors to constrain
+    the update direction, with a Lagrange multiplier from a bisection solver.
 
     References:
-        - Spectral MuP: Spectral Control of Feature Learning
-        - Modular Duality in Deep Learning. arXiv:2410.21265 (2024).
+        - Spectral MuP: Spectral Control of Feature Learning.
+        - Modular Duality in Deep Learning: https://arxiv.org/abs/2410.21265.
 
     Args:
-        params (ParamsT): The parameters to be optimized by Muon.
-        lr (float): Learning rate.
-        momentum (float): The momentum used by the internal SGD.
-        weight_decay (float): Weight decay (L2 penalty).
-        weight_decouple (bool): The optimizer uses decoupled weight decay as in AdamW.
-        nesterov (bool): Whether to use nesterov momentum.
-        power_iteration_steps (int): Number of power iteration steps for spectral norm computation.
-        msign_steps (int): Number of Newton-Schulz iterations for msign (uses Polar-Express).
-        solver_tolerance_f (float): Function value tolerance for solver.
-        solver_max_iterations (int): Maximum iterations for solver.
-        maximize (bool): Maximize the objective with respect to the params, instead of minimizing.
-
-    Example:
-        from pytorch_optimizer import SpectralSphere
-
-        hidden_weights = [p for p in model.body.parameters() if p.ndim >= 2]
-
-        param_groups = [
-            dict(params=hidden_weights, lr=0.02, weight_decay=0.01),
-        ]
-
-        optimizer = SpectralSphere(param_groups)
-        ...
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        momentum: Momentum factor.
+        weight_decay: Weight decay coefficient.
+        weight_decouple: Apply weight decay to parameters instead of adding it to the gradient.
+        nesterov: Use Nesterov momentum.
+        power_iteration_steps: Number of power iteration steps for spectral norm computation.
+        msign_steps: Number of Newton-Schulz iterations for msign (uses Polar Express).
+        solver_tolerance_f: Function value tolerance for solver.
+        solver_max_iterations: Maximum iterations for solver.
+        maximize: Maximize the objective instead of minimizing it.
+        foreach: Batch compatible spectral constraints. `None` enables batching on CUDA.
 
     """
 
@@ -296,6 +346,7 @@ class SpectralSphere(BaseOptimizer):
         solver_tolerance_f: float = 1e-8,
         solver_max_iterations: int = 100,
         maximize: bool = False,
+        foreach: bool | None = None,
         **kwargs,
     ):
         self.validate_learning_rate(lr)
@@ -317,6 +368,7 @@ class SpectralSphere(BaseOptimizer):
             'nesterov': nesterov,
             'weight_decay': weight_decay,
             'weight_decouple': weight_decouple,
+            'foreach': foreach,
             **kwargs,
         }
 
@@ -359,6 +411,10 @@ class SpectralSphere(BaseOptimizer):
             self.init_group(group)
             group['step'] += 1
 
+            if self.can_use_foreach(group, group.get('foreach'), default_on_cuda=True):
+                self._step_foreach(group)
+                continue
+
             for p in group['params']:
                 if p.grad is None:
                     continue
@@ -395,3 +451,44 @@ class SpectralSphere(BaseOptimizer):
                 p.add_(update, alpha=-group['lr'])
 
         return loss
+
+    def _step_foreach(self, group: ParamGroup) -> None:
+        params, grads, state = self.collect_trainable_params(group, self.state, ['momentum_buffer'])
+
+        for batch in group_tensors_by_device_and_dtype(params, grads, state):
+            params, grads = batch['params'], batch['grads']
+
+            if self.maximize:
+                torch._foreach_neg_(grads)
+
+            self.apply_weight_decay_foreach(
+                params, grads, group['lr'], group['weight_decay'], group['weight_decouple'], False
+            )
+
+            torch._foreach_lerp_(batch['momentum_buffer'], grads, weight=1.0 - group['momentum'])
+
+            if group['nesterov']:
+                torch._foreach_lerp_(grads, batch['momentum_buffer'], weight=group['momentum'])
+            else:
+                grads = batch['momentum_buffer']
+
+            shapes: defaultdict[tuple, list[int]] = defaultdict(list)
+
+            for index, p in enumerate(params):
+                shapes[p.shape].append(index)
+
+            for indices in shapes.values():
+                weights = torch.stack([params[index] for index in indices])
+                momentum = torch.stack([grads[index] for index in indices]).float()
+                momentum.div_(torch.linalg.vector_norm(momentum, dim=(-2, -1), keepdim=True).clamp_min_(1e-8))
+
+                u, v = power_iteration(weights, self.power_iteration_steps)
+                theta = u @ v.mT
+
+                multipliers = solve_lambda_foreach(
+                    momentum, theta, self.msign_steps, self.solver_tolerance_f, self.solver_max_iterations
+                )
+
+                scaled_theta = (multipliers[:, None, None] * theta).to(theta.dtype)
+                updates = msign(momentum + scaled_theta, self.msign_steps)
+                torch._foreach_add_([params[index] for index in indices], updates.unbind(), alpha=-group['lr'])

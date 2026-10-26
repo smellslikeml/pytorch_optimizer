@@ -1,39 +1,43 @@
-from typing import Tuple
 
 import torch
 
 from pytorch_optimizer.base.exception import NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Betas, Closure, Defaults, Loss, ParamGroup, ParamsT
+from pytorch_optimizer.optimizer.utils.foreach import foreach_addcdiv_, group_tensors_by_device_and_dtype
 
 
 class QHAdam(BaseOptimizer):
-    """Quasi-hyperbolic momentum and Adam for deep learning.
+    """Adam with quasi-hyperbolic moment averaging.
 
     Args:
-        params (ParamsT): iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): learning rate.
-        betas (Betas): coefficients used for computing running averages of gradient and the squared Hessian trace.
-        nus (Tuple[float, float]): immediate discount factors used to estimate the gradient and its square.
-        weight_decay (float): weight decay (L2 penalty).
-        weight_decouple (bool): the optimizer uses decoupled weight decay as in AdamW.
-        fixed_decay (bool): fix weight decay.
-        eps (float): term added to the denominator to improve numerical stability.
-        maximize (bool): maximize the objective with respect to the params, instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        betas: Decay rates for the gradient mean and squared gradients.
+        nus: Weights of the running averages relative to the current gradient and its square.
+        weight_decay: Weight decay coefficient.
+        weight_decouple: Apply weight decay to parameters instead of adding it to the gradient.
+        fixed_decay: Apply decoupled weight decay without scaling it by the learning rate.
+        eps: Term added to the denominator to improve numerical stability.
+        maximize: Maximize the objective instead of minimizing it.
+        foreach: Use batched tensor operations with additional temporary memory. `None` enables them when supported.
 
     """
+
+    _supports_compiled_foreach = True
 
     def __init__(
         self,
         params: ParamsT,
-        lr: float = 1e-3,
+        lr: float | torch.Tensor = 1e-3,
         betas: Betas = (0.9, 0.999),
-        nus: Tuple[float, float] = (1.0, 1.0),
+        nus: tuple[float, float] = (1.0, 1.0),
         weight_decay: float = 0.0,
         weight_decouple: bool = False,
         fixed_decay: bool = False,
         eps: float = 1e-8,
         maximize: bool = False,
+        foreach: bool | None = None,
         **kwargs,
     ):
         self.validate_learning_rate(lr)
@@ -43,6 +47,7 @@ class QHAdam(BaseOptimizer):
         self.validate_non_negative(eps, 'eps')
 
         self.maximize = maximize
+        self.foreach = foreach
 
         defaults: Defaults = {
             'lr': lr,
@@ -52,6 +57,7 @@ class QHAdam(BaseOptimizer):
             'weight_decouple': weight_decouple,
             'fixed_decay': fixed_decay,
             'eps': eps,
+            'foreach': foreach,
         }
 
         super().__init__(params, defaults)
@@ -79,6 +85,55 @@ class QHAdam(BaseOptimizer):
                 state['exp_avg'] = torch.zeros_like(p)
                 state['exp_avg_sq'] = torch.zeros_like(p)
 
+    def _step_foreach(
+        self,
+        group: ParamGroup,
+        params: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        exp_avgs: list[torch.Tensor],
+        exp_avg_sqs: list[torch.Tensor],
+        beta1_weights: list[torch.Tensor],
+        beta2_weights: list[torch.Tensor],
+    ) -> None:
+        beta1, beta2 = group['betas']
+        nu1, nu2 = group['nus']
+
+        if self.maximize:
+            torch._foreach_neg_(grads)
+
+        self.apply_weight_decay_foreach(
+            params, grads, group['lr'], group['weight_decay'], group['weight_decouple'], group['fixed_decay']
+        )
+
+        torch._foreach_mul_(beta1_weights, beta1)
+        torch._foreach_add_(beta1_weights, 1.0)
+        torch._foreach_mul_(beta2_weights, beta2)
+        torch._foreach_add_(beta2_weights, 1.0)
+
+        weights1 = [weight.to(dtype=grads[0].dtype).reshape(()) for weight in torch._foreach_reciprocal(beta1_weights)]
+        weights2 = [weight.to(dtype=grads[0].dtype).reshape(()) for weight in torch._foreach_reciprocal(beta2_weights)]
+
+        for exp_avg, grad, weight in zip(exp_avgs, grads, weights1):
+            exp_avg.lerp_(grad, weight=weight)
+
+        grad_p2 = torch._foreach_pow(grads, 2)
+        for exp_avg_sq, grad_sq, weight in zip(exp_avg_sqs, grad_p2, weights2):
+            exp_avg_sq.lerp_(grad_sq, weight=weight)
+
+        avg_grad_rms = torch._foreach_mul(exp_avg_sqs, nu2)
+        if nu2 != 1.0:
+            torch._foreach_add_(avg_grad_rms, grad_p2, alpha=1.0 - nu2)
+
+        torch._foreach_sqrt_(avg_grad_rms)
+        torch._foreach_add_(avg_grad_rms, group['eps'])
+
+        avg_grads = exp_avgs
+        if nu1 != 1.0:
+            avg_grads = torch._foreach_mul(exp_avgs, nu1)
+            torch._foreach_add_(avg_grads, grads, alpha=1.0 - nu1)
+
+        foreach_addcdiv_(params, avg_grads, avg_grad_rms, value=-group['lr'])
+
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
         loss: Loss = None
@@ -89,6 +144,17 @@ class QHAdam(BaseOptimizer):
         for group in self.param_groups:
             self.init_group(group)
             group['step'] += 1
+
+            if self.can_use_foreach(group, group.get('foreach', self.foreach)):
+                params, grads, state_dict = self.collect_trainable_params(
+                    group, self.state, state_keys=['exp_avg', 'exp_avg_sq', 'beta1_weight', 'beta2_weight']
+                )
+                for batch in group_tensors_by_device_and_dtype(params, grads, state_dict):
+                    self._step_foreach(
+                        group, batch['params'], batch['grads'], batch['exp_avg'], batch['exp_avg_sq'],
+                        batch['beta1_weight'], batch['beta2_weight'],
+                    )
+                continue
 
             beta1, beta2 = group['betas']
             nu1, nu2 = group['nus']
@@ -120,17 +186,14 @@ class QHAdam(BaseOptimizer):
                 beta1_weight.mul_(beta1).add_(1.0)
                 beta2_weight.mul_(beta2).add_(1.0)
 
-                beta1_adj = 1.0 - (1.0 / beta1_weight)
-                beta2_adj = 1.0 - (1.0 / beta2_weight)
-
                 grad_p2 = grad.pow(2)
 
-                exp_avg.mul_(beta1_adj).add_((1.0 - beta1_adj) * grad)
-                exp_avg_sq.mul_(beta2_adj).add_(1.0 - beta2_adj * grad_p2)
+                exp_avg.lerp_(grad, weight=beta1_weight.reciprocal().to(dtype=grad.dtype).reshape(()))
+                exp_avg_sq.lerp_(grad_p2, weight=beta2_weight.reciprocal().to(dtype=grad.dtype).reshape(()))
 
-                avg_grad = exp_avg.mul(nu1)
+                avg_grad = exp_avg
                 if nu1 != 1.0:
-                    avg_grad.add_(grad, alpha=1.0 - nu1)
+                    avg_grad = exp_avg.mul(nu1).add_(grad, alpha=1.0 - nu1)
 
                 avg_grad_rms = exp_avg_sq.mul(nu2)
                 if nu2 != 1.0:

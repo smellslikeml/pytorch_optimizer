@@ -1,43 +1,47 @@
-from typing import List, Optional
-
 import torch
 
 from pytorch_optimizer.base.exception import NoComplexParameterError, NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Closure, Defaults, Loss, ParamGroup, ParamsT
+from pytorch_optimizer.optimizer.utils.foreach import foreach_add_, foreach_lerp_, group_tensors_by_device_and_dtype
 
 
 class SRMM(BaseOptimizer):
-    """Stochastic regularized majorization-minimization with weakly convex and multi-convex surrogates.
+    """Stochastic regularized majorization-minimization with weakly convex and multi convex surrogates.
 
     Args:
-        params (ParamsT): Iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): Learning rate.
-        beta (float): Adaptivity weight.
-        memory_length (Optional[int]): Internal memory length for moving average. None for no refreshing.
-        maximize (bool): Maximize the objective with respect to the parameters instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        beta: Adaptivity weight.
+        memory_length: Internal memory length for moving average. None for no refreshing.
+        maximize: Maximize the objective instead of minimizing it.
+        foreach: Use batched tensor operations. `None` enables them for supported parameter groups.
 
     """
+
+    _supports_compiled_foreach = True
 
     def __init__(
         self,
         params: ParamsT,
-        lr: float = 0.01,
+        lr: float | torch.Tensor = 0.01,
         beta: float = 0.5,
-        memory_length: Optional[int] = 100,
+        memory_length: int | None = 100,
         maximize: bool = False,
+        foreach: bool | None = None,
         **kwargs,
     ):
         self.validate_learning_rate(lr)
         self.validate_range(beta, 'beta', 0.0, 1.0, range_type='[]')
 
         self.maximize = maximize
+        self.foreach = foreach
 
-        defaults: Defaults = {'lr': lr, 'beta': beta, 'memory_length': memory_length}
+        defaults: Defaults = {'lr': lr, 'beta': beta, 'memory_length': memory_length, 'foreach': foreach}
 
         super().__init__(params, defaults)
 
-        self.base_lrs: List[float] = [group['lr'] for group in self.param_groups]
+        self.base_lrs: list[float] = [group['lr'] for group in self.param_groups]
 
     def __str__(self) -> str:
         return 'SRMM'
@@ -63,6 +67,24 @@ class SRMM(BaseOptimizer):
                 state['mov_avg_grad'] = torch.zeros_like(grad)
                 state['mov_avg_param'] = torch.zeros_like(grad)
 
+    def _step_foreach(
+        self,
+        group: ParamGroup,
+        params: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        state: dict[str, list[torch.Tensor]],
+        w_t: float | torch.Tensor,
+    ) -> None:
+        mov_avg_grads, mov_avg_params = state['mov_avg_grad'], state['mov_avg_param']
+
+        if self.maximize:
+            torch._foreach_neg_(grads)
+
+        foreach_lerp_(mov_avg_grads, grads, weight=w_t)
+        foreach_lerp_(mov_avg_params, params, weight=w_t)
+        foreach_add_(mov_avg_params, mov_avg_grads, alpha=-group['lr'])
+        torch._foreach_copy_(params, mov_avg_params)
+
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
         loss: Loss = None
@@ -78,6 +100,14 @@ class SRMM(BaseOptimizer):
                 (group['step'] % (group['memory_length'] if group['memory_length'] is not None else 1)) + 1
             ) ** -group['beta']
 
+            if self.can_use_foreach(group, group.get('foreach', self.foreach)):
+                params, grads, state = self.collect_trainable_params(
+                    group, self.state, state_keys=['mov_avg_grad', 'mov_avg_param']
+                )
+                for batch in group_tensors_by_device_and_dtype(params, grads, state):
+                    self._step_foreach(group, batch['params'], batch['grads'], batch, w_t)
+                continue
+
             for p in group['params']:
                 if p.grad is None:
                     continue
@@ -90,8 +120,8 @@ class SRMM(BaseOptimizer):
 
                 mov_avg_grad, mov_avg_param = state['mov_avg_grad'], state['mov_avg_param']
 
-                mov_avg_grad.mul_(1.0 - w_t).add_(grad, alpha=w_t)
-                mov_avg_param.mul_(1.0 - w_t).add_(p, alpha=w_t)
+                mov_avg_grad.lerp_(grad, weight=w_t)
+                mov_avg_param.lerp_(p, weight=w_t)
 
                 mov_avg_param.add_(mov_avg_grad, alpha=-group['lr'])
 

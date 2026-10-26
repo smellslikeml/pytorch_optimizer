@@ -1,5 +1,4 @@
 import math
-from typing import List, Optional, Union
 
 import torch
 
@@ -7,25 +6,27 @@ from pytorch_optimizer.base.exception import NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Betas, Closure, Defaults, Loss, ParamGroup, ParamsT
 from pytorch_optimizer.optimizer.gradient_centralization import centralize_gradient
-from pytorch_optimizer.optimizer.utils import get_global_gradient_norm
+from pytorch_optimizer.optimizer.utils.foreach import foreach_addcdiv_, group_tensors_by_device_and_dtype
+from pytorch_optimizer.optimizer.utils.gradient import get_global_gradient_norm
 
 
 class Adan(BaseOptimizer):
-    """Adaptive Nesterov Momentum Algorithm for Faster Optimizing Deep Models.
+    """Adaptive updates with gradient difference momentum.
 
     Args:
-        params (ParamsT): Iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): Learning rate.
-        betas (Betas): Coefficients used for computing running averages of gradient and the squared Hessian trace.
-        weight_decay (float): Weight decay (L2 penalty).
-        weight_decouple (bool): Decoupled weight decay.
-        max_grad_norm (float): Maximum gradient norm to clip.
-        foreach (Optional[bool]): Whether to use foreach (multi-tensor) operations for speed.
-            None means auto-detect based on device (True for CUDA, False otherwise).
-        eps (float): Term added to the denominator to improve numerical stability.
-        maximize (bool): Maximize the objective with respect to the parameters, instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        betas: Decay rates for gradients, gradient differences, and squared corrected gradients.
+        weight_decay: Weight decay coefficient.
+        weight_decouple: Apply weight decay to parameters instead of adding it to the gradient.
+        max_grad_norm: Maximum gradient norm to clip.
+        foreach: Use batched tensor operations. `None` enables them for supported parameter groups.
+        eps: Term added to the denominator to improve numerical stability.
+        maximize: Maximize the objective instead of minimizing it.
 
     """
+
+    _supports_compiled_foreach = True
 
     def __init__(
         self,
@@ -35,7 +36,7 @@ class Adan(BaseOptimizer):
         weight_decay: float = 0.0,
         weight_decouple: bool = False,
         max_grad_norm: float = 0.0,
-        foreach: Optional[bool] = None,
+        foreach: bool | None = None,
         eps: float = 1e-8,
         maximize: bool = False,
         **kwargs,
@@ -92,7 +93,7 @@ class Adan(BaseOptimizer):
                     state['exp_grad_adanorm'] = torch.zeros((1,), dtype=grad.dtype, device=grad.device)
 
     @torch.no_grad()
-    def get_global_gradient_norm(self) -> Union[torch.Tensor, float]:
+    def get_global_gradient_norm(self) -> torch.Tensor | float:
         if self.defaults['max_grad_norm'] == 0.0:
             return 1.0
 
@@ -113,36 +114,34 @@ class Adan(BaseOptimizer):
     def _step_foreach(
         self,
         group: ParamGroup,
-        params: List[torch.Tensor],
-        grads: List[torch.Tensor],
-        exp_avgs: List[torch.Tensor],
-        exp_avg_sqs: List[torch.Tensor],
-        exp_avg_diffs: List[torch.Tensor],
-        prev_grads: List[torch.Tensor],
-        clip_global_grad_norm: Union[torch.Tensor, float],
+        params: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        exp_avgs: list[torch.Tensor],
+        exp_avg_sqs: list[torch.Tensor],
+        exp_avg_diffs: list[torch.Tensor],
+        prev_grads: list[torch.Tensor],
+        clip_global_grad_norm: torch.Tensor | float,
+        step_size: float | torch.Tensor,
+        diff_step_size: float | torch.Tensor,
+        bias_correction3_sq: float | torch.Tensor,
     ) -> None:
         beta1, beta2, beta3 = group['betas']
         lr = group['lr']
-
-        bias_correction1: float = self.debias(beta1, group['step'])
-        bias_correction2: float = self.debias(beta2, group['step'])
-        bias_correction3_sq: float = math.sqrt(self.debias(beta3, group['step']))
 
         if self.maximize:
             torch._foreach_neg_(grads)
 
         if isinstance(clip_global_grad_norm, torch.Tensor):
-            clip_global_grad_norm = clip_global_grad_norm.item()
+            clip_global_grad_norm = clip_global_grad_norm.reshape(())
 
-        torch._foreach_mul_(grads, clip_global_grad_norm)
+        if isinstance(clip_global_grad_norm, torch.Tensor) or clip_global_grad_norm != 1.0:
+            torch._foreach_mul_(grads, clip_global_grad_norm)
 
-        grad_diffs = torch._foreach_add(prev_grads, grads)
+        grad_diffs = prev_grads
+        torch._foreach_add_(grad_diffs, grads)
 
-        torch._foreach_mul_(exp_avgs, beta1)
-        torch._foreach_add_(exp_avgs, grads, alpha=1.0 - beta1)
-
-        torch._foreach_mul_(exp_avg_diffs, beta2)
-        torch._foreach_add_(exp_avg_diffs, grad_diffs, alpha=1.0 - beta2)
+        torch._foreach_lerp_(exp_avgs, grads, weight=1.0 - beta1)
+        torch._foreach_lerp_(exp_avg_diffs, grad_diffs, weight=1.0 - beta2)
 
         torch._foreach_mul_(grad_diffs, beta2)
         torch._foreach_add_(grad_diffs, grads)
@@ -154,18 +153,19 @@ class Adan(BaseOptimizer):
         torch._foreach_div_(de_noms, bias_correction3_sq)
         torch._foreach_add_(de_noms, group['eps'])
 
-        if group['weight_decouple']:
+        if group['weight_decay'] != 0.0 and group['weight_decouple']:
             torch._foreach_mul_(params, 1.0 - lr * group['weight_decay'])
 
-        torch._foreach_addcdiv_(params, exp_avgs, de_noms, value=-lr / bias_correction1)
-        torch._foreach_addcdiv_(params, exp_avg_diffs, de_noms, value=-lr * beta2 / bias_correction2)
+        foreach_addcdiv_(params, exp_avgs, de_noms, value=-step_size)
+        foreach_addcdiv_(params, exp_avg_diffs, de_noms, value=-diff_step_size)
 
-        if not group['weight_decouple']:
+        if group['weight_decay'] != 0.0 and not group['weight_decouple']:
             torch._foreach_div_(params, 1.0 + lr * group['weight_decay'])
 
-        torch._foreach_copy_(prev_grads, torch._foreach_neg(grads))
+        torch._foreach_copy_(prev_grads, grads)
+        torch._foreach_neg_(prev_grads)
 
-    def _step_per_param(self, group: ParamGroup, clip_global_grad_norm: Union[torch.Tensor, float]) -> None:
+    def _step_per_param(self, group: ParamGroup, clip_global_grad_norm: torch.Tensor | float) -> None:
         beta1, beta2, beta3 = group['betas']
 
         bias_correction1: float = self.debias(beta1, group['step'])
@@ -203,21 +203,21 @@ class Adan(BaseOptimizer):
                 r=group.get('adanorm_r', None),
             )
 
-            exp_avg.mul_(beta1).add_(s_grad, alpha=1.0 - beta1)
-            exp_avg_diff.mul_(beta2).add_(grad_diff, alpha=1.0 - beta2)
+            exp_avg.lerp_(s_grad, weight=1.0 - beta1)
+            exp_avg_diff.lerp_(grad_diff, weight=1.0 - beta2)
 
             grad_diff.mul_(beta2).add_(grad)
             exp_avg_sq.mul_(beta3).addcmul_(grad_diff, grad_diff, value=1.0 - beta3)
 
             de_nom = exp_avg_sq.sqrt().div_(bias_correction3_sq).add_(group['eps'])
 
-            if group['weight_decouple']:
+            if group['weight_decay'] != 0.0 and group['weight_decouple']:
                 p.mul_(1.0 - group['lr'] * group['weight_decay'])
 
             p.addcdiv_(exp_avg, de_nom, value=-group['lr'] / bias_correction1)
             p.addcdiv_(exp_avg_diff, de_nom, value=-group['lr'] * beta2 / bias_correction2)
 
-            if not group['weight_decouple']:
+            if group['weight_decay'] != 0.0 and not group['weight_decouple']:
                 p.div_(1.0 + group['lr'] * group['weight_decay'])
 
             grad.neg_()
@@ -242,16 +242,23 @@ class Adan(BaseOptimizer):
                 params, grads, state_dict = self.collect_trainable_params(
                     group, self.state, state_keys=['exp_avg', 'exp_avg_sq', 'exp_avg_diff', 'previous_grad']
                 )
-                if params:
+                beta1, beta2, beta3 = group['betas']
+                step_size = group['lr'] / self.debias(beta1, group['step'])
+                diff_step_size = group['lr'] * beta2 / self.debias(beta2, group['step'])
+                bias_correction3_sq = math.sqrt(self.debias(beta3, group['step']))
+                for tensors in group_tensors_by_device_and_dtype(params, grads, state_dict):
                     self._step_foreach(
                         group,
-                        params,
-                        grads,
-                        state_dict['exp_avg'],
-                        state_dict['exp_avg_sq'],
-                        state_dict['exp_avg_diff'],
-                        state_dict['previous_grad'],
+                        tensors['params'],
+                        tensors['grads'],
+                        tensors['exp_avg'],
+                        tensors['exp_avg_sq'],
+                        tensors['exp_avg_diff'],
+                        tensors['previous_grad'],
                         clip_global_grad_norm,
+                        step_size,
+                        diff_step_size,
+                        bias_correction3_sq,
                     )
             else:
                 self._step_per_param(group, clip_global_grad_norm)

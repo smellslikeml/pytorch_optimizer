@@ -1,17 +1,19 @@
-from typing import Callable, Optional
+from collections.abc import Callable, Iterable
 
 import torch
 
 from pytorch_optimizer.base.exception import NoClosureError, NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Closure, Defaults, Loss, ParamGroup, ParamsT
-from pytorch_optimizer.optimizer.utils import get_global_gradient_norm
+from pytorch_optimizer.optimizer.utils.foreach import foreach_add_, group_tensors_by_device_and_dtype
+from pytorch_optimizer.optimizer.utils.gradient import get_global_gradient_norm
 
 
 @torch.no_grad()
-def l2_projection(parameters: ParamsT, max_norm: float = 1e2) -> None:
-    r"""Get l2 normalized parameter."""
-    global_norm = torch.sqrt(sum(p.norm().pow(2) for p in parameters or []))
+def l2_projection(parameters: Iterable[torch.Tensor], max_norm: float = 1e2) -> None:
+    """Project parameters onto an L2 ball in place."""
+    parameters = list(parameters or [])
+    global_norm = torch.sqrt(sum(p.norm().pow(2) for p in parameters))
     if global_norm > max_norm:
         ratio = max_norm / global_norm
         for param in parameters or []:
@@ -19,26 +21,30 @@ def l2_projection(parameters: ParamsT, max_norm: float = 1e2) -> None:
 
 
 class AliG(BaseOptimizer):
-    """Adaptive Learning Rates for Interpolation with Gradients.
+    """Gradient steps scaled by loss with an optional learning rate cap.
 
     Args:
-        params (ParamsT): Iterable of parameters to optimize or dicts defining parameter groups.
-        max_lr (Optional[float]): Maximum learning rate.
-        projection_fn (Callable): Projection function to enforce constraints.
-        momentum (float): Momentum factor.
-        adjusted_momentum (bool): If True, use PyTorch-like momentum instead of standard Nesterov momentum.
-        maximize (bool): Maximize the objective with respect to the parameters, instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        max_lr: Maximum learning rate.
+        projection_fn: Projection function to enforce constraints.
+        momentum: Momentum factor.
+        adjusted_momentum: If True, use PyTorch like momentum instead of standard Nesterov momentum.
+        maximize: Maximize the objective instead of minimizing it.
+        foreach: Use batched tensor operations. `None` enables them for supported parameter groups.
 
     """
+
+    _supports_compiled_foreach = True
 
     def __init__(
         self,
         params: ParamsT,
-        max_lr: Optional[float] = None,
-        projection_fn: Optional[Callable] = None,
+        max_lr: float | torch.Tensor | None = None,
+        projection_fn: Callable | None = None,
         momentum: float = 0.0,
         adjusted_momentum: bool = False,
         maximize: bool = False,
+        foreach: bool | None = None,
         **kwargs,
     ):
         self.validate_learning_rate(max_lr)
@@ -47,7 +53,9 @@ class AliG(BaseOptimizer):
         self.projection_fn = projection_fn
         self.maximize = maximize
 
-        defaults: Defaults = {'max_lr': max_lr, 'adjusted_momentum': adjusted_momentum, 'momentum': momentum}
+        defaults: Defaults = {
+            'max_lr': max_lr, 'adjusted_momentum': adjusted_momentum, 'momentum': momentum, 'foreach': foreach,
+        }
 
         super().__init__(params, defaults)
 
@@ -78,11 +86,35 @@ class AliG(BaseOptimizer):
 
     @torch.no_grad()
     def compute_step_size(self, loss: float) -> float:
-        r"""Compute step_size."""
+        """Divide the loss by the sum of squared gradient norms plus a stability term."""
         global_grad_norm = get_global_gradient_norm(self.param_groups)
         global_grad_norm.add_(1e-6)
 
         return loss / global_grad_norm.item()
+
+    def _step_foreach(
+        self,
+        group: ParamGroup,
+        params: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        buffers: list[torch.Tensor],
+    ) -> None:
+        step_size, momentum = group['lr'], group['momentum']
+
+        if self.maximize:
+            torch._foreach_neg_(grads)
+
+        foreach_add_(params, grads, alpha=-step_size)
+
+        if buffers:
+            torch._foreach_mul_(buffers, momentum)
+
+            if group['adjusted_momentum']:
+                torch._foreach_sub_(buffers, grads)
+                foreach_add_(params, buffers, alpha=step_size * momentum)
+            else:
+                foreach_add_(buffers, grads, alpha=-step_size)
+                torch._foreach_add_(params, buffers, alpha=momentum)
 
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
@@ -102,6 +134,21 @@ class AliG(BaseOptimizer):
             step_size = group['step_size'] = (
                 min(un_clipped_step_size, group['max_lr']) if group['max_lr'] is not None else un_clipped_step_size
             )
+
+            if self.can_use_foreach(group, group.get('foreach')):
+                params, grads, state_dict = self.collect_trainable_params(
+                    group, self.state, state_keys=['momentum_buffer'] if momentum > 0.0 else []
+                )
+
+                for batch in group_tensors_by_device_and_dtype(params, grads, state_dict):
+                    self._step_foreach(
+                        {**group, 'lr': step_size}, batch['params'], batch['grads'], batch.get('momentum_buffer', [])
+                    )
+
+                if self.projection_fn is not None:
+                    self.projection_fn()
+
+                continue
 
             for p in group['params']:
                 if p.grad is None:

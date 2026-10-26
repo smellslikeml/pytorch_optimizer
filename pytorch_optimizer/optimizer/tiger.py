@@ -1,37 +1,38 @@
-from typing import List, Optional
 
 import torch
 
 from pytorch_optimizer.base.exception import NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Closure, Defaults, Loss, ParamGroup, ParamsT
+from pytorch_optimizer.optimizer.utils.foreach import foreach_add_, group_tensors_by_device_and_dtype
 
 
 class Tiger(BaseOptimizer):
-    r"""A Tight-fisted Optimizer, an optimizer that is extremely budget-conscious.
+    """Sign based updates with a single gradient momentum buffer.
 
     Args:
-        params (ParamsT): Iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): Learning rate.
-        beta (float): Coefficient used for computing running averages of gradient and the squared Hessian trace.
-        weight_decay (float): Weight decay (L2 penalty).
-        weight_decouple (bool): Whether the optimizer uses decoupled weight decay as in AdamW.
-        fixed_decay (bool): Whether to fix weight decay.
-        foreach (Optional[bool]): Whether to use foreach (multi-tensor) operations for speed.
-            None means auto-detect based on device (True for CUDA, False otherwise).
-        maximize (bool): Maximize the objective with respect to the parameters instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        beta: Decay rate for gradient momentum.
+        weight_decay: Weight decay coefficient.
+        weight_decouple: Apply weight decay to parameters instead of adding it to the gradient.
+        fixed_decay: Apply decoupled weight decay without scaling it by the learning rate.
+        foreach: Use batched tensor operations. `None` enables them for supported parameter groups.
+        maximize: Maximize the objective instead of minimizing it.
 
     """
+
+    _supports_compiled_foreach = True
 
     def __init__(
         self,
         params: ParamsT,
-        lr: float = 1e-3,
+        lr: float | torch.Tensor = 1e-3,
         beta: float = 0.965,
         weight_decay: float = 0.01,
         weight_decouple: bool = True,
         fixed_decay: bool = False,
-        foreach: Optional[bool] = None,
+        foreach: bool | None = None,
         maximize: bool = False,
         **kwargs,
     ):
@@ -82,9 +83,9 @@ class Tiger(BaseOptimizer):
     def _step_foreach(
         self,
         group: ParamGroup,
-        params: List[torch.Tensor],
-        grads: List[torch.Tensor],
-        exp_avgs: List[torch.Tensor],
+        params: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        exp_avgs: list[torch.Tensor],
     ) -> None:
         if self.maximize:
             torch._foreach_neg_(grads)
@@ -102,7 +103,7 @@ class Tiger(BaseOptimizer):
 
         updates = torch._foreach_sign(exp_avgs)
 
-        torch._foreach_add_(params, updates, alpha=-group['lr'])
+        foreach_add_(params, updates, alpha=-group['lr'])
 
     def _step_per_param(self, group: ParamGroup) -> None:
         beta = group['beta']
@@ -144,8 +145,8 @@ class Tiger(BaseOptimizer):
 
             if self._can_use_foreach(group):
                 params, grads, state_dict = self.collect_trainable_params(group, self.state, state_keys=['exp_avg'])
-                if params:
-                    self._step_foreach(group, params, grads, state_dict['exp_avg'])
+                for tensors in group_tensors_by_device_and_dtype(params, grads, state_dict):
+                    self._step_foreach(group, tensors['params'], tensors['grads'], tensors['exp_avg'])
             else:
                 self._step_per_param(group)
 

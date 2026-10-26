@@ -5,30 +5,39 @@ import torch
 from pytorch_optimizer.base.exception import NoComplexParameterError, NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Betas, Closure, Defaults, Loss, ParamGroup, ParamsT
-from pytorch_optimizer.optimizer.galore_utils import GaLoreProjector
+from pytorch_optimizer.optimizer.utils.foreach import group_tensors_by_device_and_dtype
+from pytorch_optimizer.optimizer.utils.galore import GaLoreProjector, update_unprojected_foreach
 
 
 class Fira(BaseOptimizer):
-    """Can We Achieve Full-rank Training of LLMs Under Low-rank Constraint? Fira with AdamW optimizer.
+    """AdamW with low rank updates and full rank gradient compensation.
+
+    Add `rank`, `update_proj_gap`, `scale`, and `projection_type` to parameter groups
+    containing matrix weights to enable projection.
 
     Args:
-        params (ParamsT): Iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): Learning rate.
-        betas (Betas): Coefficients used for computing running averages of gradient and the squared hessian trace.
-        weight_decay (float): Weight decay (L2 penalty).
-        eps (float): Term added to the denominator to improve numerical stability.
-        maximize (bool): Maximize the objective with respect to the params, instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        betas: Decay rates for the first and second moments.
+        weight_decay: Weight decay coefficient.
+        eps: Term added to the denominator to improve numerical stability.
+        maximize: Maximize the objective instead of minimizing it.
+        foreach: Batch unprojected parameter updates. `None` enables batching for supported groups.
 
     """
+
+    _supports_compiled_foreach = True
+    _step_foreach = staticmethod(update_unprojected_foreach)
 
     def __init__(
         self,
         params: ParamsT,
-        lr: float = 1e-3,
+        lr: float | torch.Tensor = 1e-3,
         betas: Betas = (0.9, 0.999),
         weight_decay: float = 0.0,
         eps: float = 1e-6,
         maximize: bool = False,
+        foreach: bool | None = None,
         **kwargs,
     ):
         self.validate_learning_rate(lr)
@@ -43,6 +52,7 @@ class Fira(BaseOptimizer):
             'betas': betas,
             'weight_decay': weight_decay,
             'eps': eps,
+            'foreach': foreach,
             **kwargs,
         }
 
@@ -66,6 +76,12 @@ class Fira(BaseOptimizer):
             if torch.is_complex(p):
                 raise NoComplexParameterError(str(self))
 
+            state = self.state[p]
+
+            if ('rank' not in group or p.dim() != 2) and 'exp_avg' not in state:
+                state['exp_avg'] = torch.zeros_like(p)
+                state['exp_avg_sq'] = torch.zeros_like(p)
+
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
         loss: Loss = None
@@ -84,8 +100,31 @@ class Fira(BaseOptimizer):
 
             step_size: float = group['lr'] * bias_correction2_sq / bias_correction1
 
+            use_foreach = self.can_use_foreach(group, group.get('foreach'))
+
+            if use_foreach:
+                dense_group = {
+                    **group,
+                    'params': [p for p in group['params'] if ('rank' not in group or p.dim() != 2)],
+                }
+                params, grads, state = self.collect_trainable_params(
+                    dense_group, self.state, ['exp_avg', 'exp_avg_sq']
+                )
+
+                for batch in group_tensors_by_device_and_dtype(params, grads, state):
+                    self._step_foreach(
+                        group,
+                        batch['params'],
+                        batch['grads'],
+                        batch['exp_avg'],
+                        batch['exp_avg_sq'],
+                        step_size,
+                        group['lr'],
+                        self.maximize,
+                    )
+
             for p in group['params']:
-                if p.grad is None:
+                if p.grad is None or (use_foreach and ('rank' not in group or p.dim() != 2)):
                     continue
 
                 grad = p.grad
@@ -93,6 +132,8 @@ class Fira(BaseOptimizer):
                 self.maximize_gradient(grad, maximize=self.maximize)
 
                 state = self.state[p]
+
+                full_grad = grad
 
                 if 'rank' in group and p.dim() == 2:
                     if 'projector' not in state:
@@ -110,23 +151,32 @@ class Fira(BaseOptimizer):
                     state['exp_avg_sq'] = torch.zeros_like(grad)
 
                 exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-                exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                exp_avg.lerp_(grad, weight=1.0 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
 
                 de_nom = exp_avg_sq.sqrt().add_(group['eps'])
 
-                norm_grad = exp_avg / de_nom
+                norm_grad = de_nom
+                torch.div(exp_avg, de_nom, out=norm_grad)
 
                 if 'rank' in group and p.dim() == 2:
                     sub_grad = state['projector'].project_back(grad)
 
-                    norm_dim: int = 0 if norm_grad.shape[0] < norm_grad.shape[1] else 1
+                    projection_type = group['projection_type']
+                    is_right = (
+                        projection_type == 'right'
+                        or (projection_type in ('std', 'random') and full_grad.size(0) >= full_grad.size(1))
+                        or (projection_type == 'reverse_std' and full_grad.size(0) < full_grad.size(1))
+                    )
+                    norm_dim: int | None = None if projection_type == 'full' else (1 if is_right else 0)
 
                     scaling_factor = torch.norm(norm_grad, dim=norm_dim) / (torch.norm(grad, dim=norm_dim) + 1e-8)
                     if norm_dim == 1:
                         scaling_factor = scaling_factor.unsqueeze(1)
 
-                    scaling_grad = grad.sub(sub_grad).mul_(scaling_factor)
+                    scaling_grad = sub_grad
+                    torch.sub(full_grad, sub_grad, out=scaling_grad)
+                    scaling_grad.mul_(scaling_factor)
 
                     if 'scaling_grad' in state:
                         scaling_grad_norm = torch.norm(scaling_grad)

@@ -1,51 +1,46 @@
 import math
-from typing import List, Optional, Sequence, Tuple, Union
+from collections.abc import Sequence
 
 import torch
 
 from pytorch_optimizer.base.exception import NoComplexParameterError, NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Closure, Defaults, Loss, ParamGroup, ParamsT
-from pytorch_optimizer.optimizer.foreach_utils import foreach_rsqrt
+from pytorch_optimizer.optimizer.utils.foreach import foreach_rsqrt, foreach_rsqrt_, group_tensors_by_device_and_dtype
 
 
 class AdaFactor(BaseOptimizer):
-    """Adaptive Learning Rates with Sublinear Memory Cost with some tweaks.
-
-    PyTorch implementation of BigVision's AdaFactor variant
+    """Factored adaptive updates with the BigVision AdaFactor variant.
 
     Args:
-        params (ParamsT): Iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): Learning rate.
-        betas (Union[Tuple[None, float], Tuple[float, float], Tuple[float, float, float]]): Coefficients used for
-            computing running averages of gradient and the squared Hessian trace.
-            If beta1 is None, first momentum will be skipped. beta2 is an upper bound cap.
-        decay_rate (float): Coefficient used to compute running averages of squared gradient.
-        weight_decay (float): Weight decay (L2 penalty).
-        weight_decouple (bool): The optimizer uses decoupled weight decay as in AdamW.
-        fixed_decay (bool): Fix weight decay.
-        clip_threshold (float): Threshold of root-mean-square of final gradient update.
-        ams_bound (bool): Whether to use the AMSBound variant.
-        scale_parameter (bool): If True, the learning rate is scaled by root-mean-square of parameter.
-        relative_step (bool): If True, time-dependent learning rate is computed instead of external learning rate.
-        warmup_init (bool): Time-dependent learning rate computation depends on whether warm-up initialization is
-            being used.
-        eps1 (float): Term added to the denominator to improve numerical stability.
-        eps2 (float): Term added to the denominator to improve numerical stability.
-        momentum_dtype (torch.dtype): Type of momentum variable. In the ViT paper, it was observed that storing
-            momentum in half-precision (bfloat16 type) does not affect training dynamics and reduces optimizer
-            overhead from 2-fold to 1.5-fold.
-        foreach (Optional[bool]): Whether to use foreach (multi-tensor) operations for speed.
-            None means auto-detect based on device (True for CUDA, False otherwise).
-        maximize (bool): Maximize the objective with respect to the parameters, instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        betas: Update momentum decay and second moment decay cap. Set the first value to `None` to disable
+            momentum.
+        decay_rate: Exponent controlling the step-dependent second moment decay.
+        weight_decay: Weight decay coefficient.
+        weight_decouple: Apply weight decay to parameters instead of adding it to the gradient.
+        fixed_decay: Apply decoupled weight decay without scaling it by the learning rate.
+        clip_threshold: Maximum root mean square of the preconditioned update.
+        ams_bound: Use the running maximum of the second moment to bound adaptive updates.
+        scale_parameter: If True, the learning rate is scaled by root mean square of parameter.
+        relative_step: If True, time dependent learning rate is computed instead of external learning rate.
+        warmup_init: Warm up the relative step size from `1e-6 * step`.
+        eps1: Stability constant added to squared gradients.
+        eps2: Lower bound for parameter RMS scaling.
+        momentum_dtype: Data type for the optional momentum buffer.
+        foreach: Use batched tensor operations. `None` enables them for supported parameter groups.
+        maximize: Maximize the objective instead of minimizing it.
 
     """
+
+    _supports_compiled_foreach = True
 
     def __init__(
         self,
         params: ParamsT,
-        lr: Optional[float] = 1e-3,
-        betas: Union[Tuple[None, float], Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.999),
+        lr: float | None = 1e-3,
+        betas: tuple[None, float] | tuple[float, float] | tuple[float, float, float] = (0.9, 0.999),
         decay_rate: float = -0.8,
         weight_decay: float = 0.0,
         weight_decouple: bool = True,
@@ -58,7 +53,7 @@ class AdaFactor(BaseOptimizer):
         eps1: float = 1e-30,
         eps2: float = 1e-3,
         momentum_dtype: torch.dtype = torch.bfloat16,
-        foreach: Optional[bool] = None,
+        foreach: bool | None = None,
         maximize: bool = False,
         **kwargs,
     ):
@@ -97,6 +92,14 @@ class AdaFactor(BaseOptimizer):
     def __str__(self) -> str:
         return 'AdaFactor'
 
+    def load_state_dict(self, state_dict: dict) -> None:
+        super().load_state_dict(state_dict)
+        for group, saved_group in zip(self.param_groups, state_dict['param_groups']):
+            for p, key in zip(group['params'], saved_group['params']):
+                saved_state = state_dict['state'].get(key, {})
+                if 'exp_avg' in saved_state:
+                    self.state[p]['exp_avg'] = saved_state['exp_avg'].to(device=p.device, dtype=self.momentum_dtype)
+
     def init_group(self, group: ParamGroup, **kwargs) -> None:
         if 'step' not in group:
             group['step'] = 0
@@ -116,7 +119,7 @@ class AdaFactor(BaseOptimizer):
 
             state = self.state[p]
 
-            grad_shape: Tuple[int, ...] = grad.shape
+            grad_shape: tuple[int, ...] = grad.shape
             factored: bool = self.get_options(grad_shape)
 
             if len(state) == 0:
@@ -146,11 +149,11 @@ class AdaFactor(BaseOptimizer):
 
     def get_lr(
         self,
-        relative_step_size: Union[torch.Tensor, float],
-        rms: Union[List[torch.Tensor], torch.Tensor, float],
+        relative_step_size: torch.Tensor | float,
+        rms: Sequence[torch.Tensor] | torch.Tensor | float,
         scale_parameter: bool,
-    ) -> Union[Sequence[torch.Tensor], torch.Tensor, float]:
-        r"""Get the learning rate(s)."""
+    ) -> Sequence[torch.Tensor] | torch.Tensor | float:
+        """Compute effective learning rates with optional parameter RMS scaling."""
         if not scale_parameter:
             return relative_step_size
 
@@ -163,8 +166,8 @@ class AdaFactor(BaseOptimizer):
         return lrs
 
     @staticmethod
-    def get_options(shape: Tuple[int, ...]) -> bool:
-        r"""Get `factored`."""
+    def get_options(shape: tuple[int, ...]) -> bool:
+        """Return whether the gradient supports factored second moments."""
         return len(shape) >= 2
 
     def _can_use_foreach(self, group: ParamGroup) -> bool:
@@ -179,24 +182,33 @@ class AdaFactor(BaseOptimizer):
     def _step_foreach(
         self,
         group: ParamGroup,
-        params: List[torch.Tensor],
-        grads: List[torch.Tensor],
-        exp_avgs: List[torch.Tensor],
-        exp_avg_sq_rows: List[torch.Tensor],
-        exp_avg_sq_cols: List[torch.Tensor],
-        exp_avg_sqs: List[torch.Tensor],
-        exp_avg_sq_hats: List[torch.Tensor],
-        beta1: float,
-        beta2_t: float,
-        relative_step_size: float,
+        params: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        exp_avgs: list[torch.Tensor],
+        exp_avg_sq_rows: list[torch.Tensor],
+        exp_avg_sq_cols: list[torch.Tensor],
+        exp_avg_sqs: list[torch.Tensor],
+        exp_avg_sq_hats: list[torch.Tensor],
+        beta2_t: float | torch.Tensor,
+        relative_step_size: float | torch.Tensor,
     ) -> None:
-        bias_correction2: float = 1.0 - beta2_t
+        beta1 = group['betas'][0]
+        bias_correction2 = 1.0 - beta2_t
 
         if self.maximize:
             torch._foreach_neg_(grads)
 
-        rms_values = self.get_rms(params)
+        rms_values = self.get_rms(params) if group['scale_parameter'] else 1.0
         lrs = self.get_lr(relative_step_size, rms_values, group['scale_parameter'])
+
+        self.apply_weight_decay_foreach(
+            params=params,
+            grads=grads,
+            lr=lrs,
+            weight_decay=group['weight_decay'],
+            weight_decouple=group['weight_decouple'],
+            fixed_decay=group['fixed_decay'],
+        )
 
         updates = torch._foreach_pow(grads, 2)
         torch._foreach_add_(updates, self.eps1)
@@ -217,13 +229,20 @@ class AdaFactor(BaseOptimizer):
                 row_means.append(factored_update.mean(dim=-1))
                 col_means.append(factored_update.mean(dim=-2))
 
-            torch._foreach_lerp_(exp_avg_sq_rows, row_means, weight=bias_correction2)
-            torch._foreach_lerp_(exp_avg_sq_cols, col_means, weight=bias_correction2)
+            row_weights = (
+                [bias_correction2] * len(row_means) if isinstance(beta2_t, torch.Tensor) else bias_correction2
+            )
+            col_weights = (
+                [bias_correction2] * len(col_means) if isinstance(beta2_t, torch.Tensor) else bias_correction2
+            )
+            torch._foreach_lerp_(exp_avg_sq_rows, row_means, row_weights)
+            torch._foreach_lerp_(exp_avg_sq_cols, col_means, col_weights)
 
             self.approximate_sq_grad(exp_avg_sq_rows, exp_avg_sq_cols, factored_updates)
 
         if non_factored_updates:
-            torch._foreach_lerp_(exp_avg_sqs, non_factored_updates, weight=bias_correction2)
+            weights = [bias_correction2] * len(exp_avg_sqs) if isinstance(beta2_t, torch.Tensor) else bias_correction2
+            torch._foreach_lerp_(exp_avg_sqs, non_factored_updates, weights)
 
             non_factored_updates = foreach_rsqrt(exp_avg_sqs)
 
@@ -239,13 +258,14 @@ class AdaFactor(BaseOptimizer):
             inv_updates = torch._foreach_reciprocal(updates)
             torch._foreach_maximum_(exp_avg_sq_hats, inv_updates)
 
-            updates = foreach_rsqrt(torch._foreach_div(exp_avg_sq_hats, bias_correction2))
+            updates = torch._foreach_div(exp_avg_sq_hats, bias_correction2)
+            foreach_rsqrt_(updates)
 
         torch._foreach_mul_(updates, grads)
 
         rms_values = self.get_rms(updates)
         torch._foreach_div_(rms_values, self.clip_threshold)
-        torch._foreach_clamp_max_(rms_values, 1.0)
+        torch._foreach_clamp_min_(rms_values, 1.0)
 
         torch._foreach_div_(updates, rms_values)
         torch._foreach_mul_(updates, lrs)
@@ -257,19 +277,7 @@ class AdaFactor(BaseOptimizer):
 
             torch._foreach_lerp_(exp_avgs, updates, weight=1.0 - beta1)
 
-            if is_dtype_different:
-                updates = [exp_avg.to(grads[0].dtype) for exp_avg in exp_avgs]
-            else:
-                torch._foreach_copy_(updates, exp_avgs)
-
-        self.apply_weight_decay_foreach(
-            params=params,
-            grads=grads,
-            lr=lrs,
-            weight_decay=group['weight_decay'],
-            weight_decouple=group['weight_decouple'],
-            fixed_decay=group['fixed_decay'],
-        )
+            updates = [exp_avg.to(grads[0].dtype) for exp_avg in exp_avgs] if is_dtype_different else exp_avgs
 
         torch._foreach_sub_(params, updates)
 
@@ -290,6 +298,15 @@ class AdaFactor(BaseOptimizer):
             state['RMS'] = self.get_rms(p)
 
             lr = self.get_lr(relative_step_size, state['RMS'], group['scale_parameter'])
+
+            self.apply_weight_decay(
+                p=p,
+                grad=grad,
+                lr=lr,
+                weight_decay=group['weight_decay'],
+                weight_decouple=group['weight_decouple'],
+                fixed_decay=group['fixed_decay'],
+            )
 
             # NOTE(kozistr): adding `eps1` here instead of clipping max by eps1 later
             update = grad.square().add_(self.eps1)
@@ -313,7 +330,7 @@ class AdaFactor(BaseOptimizer):
 
             update.mul_(grad)
 
-            factor = self.get_rms(update).div_(self.clip_threshold).clamp_max_(1.0)
+            factor = self.get_rms(update).div_(self.clip_threshold).clamp_min_(1.0)
             update.div_(factor).mul_(lr)
 
             if beta1 is not None:
@@ -323,21 +340,12 @@ class AdaFactor(BaseOptimizer):
                     update = exp_avg.to(grad.dtype)
                 else:
                     exp_avg.lerp_(update, weight=1.0 - beta1)
-                    update = exp_avg.clone()
+                    update = exp_avg.clone() if group.get('cautious') else exp_avg
 
                 if group.get('cautious'):
                     self.apply_cautious(update, grad)
 
-            self.apply_weight_decay(
-                p=p,
-                grad=None,
-                lr=lr,
-                weight_decay=group['weight_decay'],
-                weight_decouple=group['weight_decouple'],
-                fixed_decay=group['fixed_decay'],
-            )
-
-            p.add_(-update)
+            p.sub_(update)
 
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
@@ -362,22 +370,22 @@ class AdaFactor(BaseOptimizer):
             )
 
             if self._can_use_foreach(group):
-                params, grads, state_dict = self.collect_trainable_params(
-                    group,
-                    self.state,
-                    state_keys=['exp_avg', 'exp_avg_sq_row', 'exp_avg_sq_col', 'exp_avg_sq', 'exp_avg_sq_hat'],
-                )
-                if params:
+                params, grads, _ = self.collect_trainable_params(group, self.state)
+                batches = group_tensors_by_device_and_dtype(params, grads)
+                for tensors in batches:
+                    state_lists = {
+                        key: [self.state[p][key] for p in tensors['params'] if key in self.state[p]]
+                        for key in ['exp_avg', 'exp_avg_sq_row', 'exp_avg_sq_col', 'exp_avg_sq', 'exp_avg_sq_hat']
+                    }
                     self._step_foreach(
                         group,
-                        params,
-                        grads,
-                        state_dict['exp_avg'],
-                        state_dict['exp_avg_sq_row'],
-                        state_dict['exp_avg_sq_col'],
-                        state_dict['exp_avg_sq'],
-                        state_dict['exp_avg_sq_hat'],
-                        beta1,
+                        tensors['params'],
+                        tensors['grads'],
+                        state_lists['exp_avg'],
+                        state_lists['exp_avg_sq_row'],
+                        state_lists['exp_avg_sq_col'],
+                        state_lists['exp_avg_sq'],
+                        state_lists['exp_avg_sq_hat'],
                         beta2_t,
                         relative_step_size,
                     )

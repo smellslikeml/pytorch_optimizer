@@ -1,34 +1,32 @@
 import math
 from itertools import chain
-from typing import List, Optional
 
 import torch
 
 from pytorch_optimizer.base.exception import NoComplexParameterError, NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Betas, Closure, DataFormat, Defaults, Loss, ParamGroup, ParamsT
-from pytorch_optimizer.optimizer.shampoo_utils import merge_small_dims
+from pytorch_optimizer.optimizer.utils.shape import merge_small_dims
 
 
 class SOAP(BaseOptimizer):
-    """Improving and Stabilizing Shampoo using Adam.
+    """Adam updates in Shampoo preconditioner eigenbases.
 
     Args:
-        params (ParamsT): Iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): Learning rate.
-        betas (Betas): Coefficients used for computing running averages of gradient and the squared Hessian trace.
-        shampoo_beta (Optional[float]): If not None, use this beta for the pre-conditioner
-            (L and R in paper, state['GG'] below) moving average instead of betas.
-        weight_decay (float): Weight decay (L2 penalty).
-        precondition_frequency (int): How often to update the pre-conditioner.
-        max_precondition_dim (int): Maximum dimension of the pre-conditioner. Set to 10000, so that we exclude most
-            common vocab sizes while including layers.
-        merge_dims (bool): Whether to merge dimensions of the pre-conditioner.
-        precondition_1d (bool): Whether to precondition 1D gradients.
-        correct_bias (bool): Whether to correct bias in Adam.
-        normalize_gradient (bool): Whether to normalize the gradients.
-        eps (float): Term added to the denominator to improve numerical stability.
-        maximize (bool): Maximize the objective with respect to the parameters, instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        betas: Decay rates for the first and second moments.
+        shampoo_beta: Decay rate for preconditioner statistics. `None` uses `beta2`.
+        weight_decay: Weight decay coefficient.
+        precondition_frequency: Number of steps between eigenbasis updates.
+        max_precondition_dim: Largest dimension to precondition. Larger dimensions use an identity transform.
+        merge_dims: Whether to merge dimensions of the preconditioner.
+        precondition_1d: Whether to precondition 1D gradients.
+        correct_bias: Whether to correct bias in Adam.
+        normalize_gradient: Whether to normalize the gradients.
+        data_format: Tensor layout for dimension merging: `'channels_first'` (NCHW) or `'channels_last'` (NHWC).
+        eps: Term added to the denominator to improve numerical stability.
+        maximize: Maximize the objective instead of minimizing it.
 
     """
 
@@ -37,7 +35,7 @@ class SOAP(BaseOptimizer):
         params: ParamsT,
         lr: float = 3e-3,
         betas: Betas = (0.95, 0.95),
-        shampoo_beta: Optional[float] = None,
+        shampoo_beta: float | None = None,
         weight_decay: float = 1e-2,
         precondition_frequency: int = 10,
         max_precondition_dim: int = 10000,
@@ -79,6 +77,13 @@ class SOAP(BaseOptimizer):
 
     def __str__(self) -> str:
         return 'SOAP'
+
+    def merge_dims(self, grad: torch.Tensor, max_precondition_dim: int) -> torch.Tensor:
+        """Merge dimensions after converting channels-last tensors to channels-first."""
+        if self.data_format == 'channels_last' and grad.dim() == 4:
+            grad = grad.permute(0, 3, 1, 2)
+
+        return grad.reshape(merge_small_dims(grad.size(), max_precondition_dim))
 
     def init_group(self, group: ParamGroup, **kwargs) -> None:
         if 'step' not in group:
@@ -139,7 +144,7 @@ class SOAP(BaseOptimizer):
             if do_permute:
                 permuted_shape = grad.permute(0, 3, 1, 2).shape
 
-            grad = grad.reshape(merge_small_dims(grad.size(), max_precondition_dim))
+            grad = self.merge_dims(grad, max_precondition_dim)
 
         for mat in state['Q']:
             if len(mat) > 0:
@@ -153,8 +158,8 @@ class SOAP(BaseOptimizer):
         return grad
 
     @staticmethod
-    def get_orthogonal_matrix(mat: torch.Tensor) -> List[torch.Tensor]:
-        matrices: List = []
+    def get_orthogonal_matrix(mat: torch.Tensor) -> list[torch.Tensor]:
+        matrices: list = []
         for m in mat:
             if len(m) == 0:
                 matrices.append([])
@@ -169,13 +174,12 @@ class SOAP(BaseOptimizer):
                 q = q.to(m.dtype)
 
             q = torch.flip(q, dims=[1])
-
             matrices.append(q)
 
         return matrices
 
     def get_orthogonal_matrix_qr(self, state, max_precondition_dim: int = 10000, merge_dims: bool = False):
-        """Compute the eigen-bases of the pre-conditioner using one round of power iteration."""
+        """Compute the eigenbases of the preconditioner using one round of power iteration."""
         original_shape = state['exp_avg_sq'].shape
         permuted_shape = original_shape
         if self.data_format == 'channels_last' and len(original_shape) == 4:
@@ -183,7 +187,7 @@ class SOAP(BaseOptimizer):
 
         exp_avg_sq = state['exp_avg_sq']
         if merge_dims:
-            exp_avg_sq = exp_avg_sq.reshape(merge_small_dims(exp_avg_sq.size(), max_precondition_dim))
+            exp_avg_sq = self.merge_dims(exp_avg_sq, max_precondition_dim)
 
         matrices = []
         for ind, (m, o) in enumerate(zip(state['GG'], state['Q'])):
@@ -191,11 +195,12 @@ class SOAP(BaseOptimizer):
                 matrices.append([])
                 continue
 
-            est_eig = torch.diag(o.T @ m @ o)
+            matrix_product = m @ o
+            est_eig = (o * matrix_product).sum(dim=0)
             sort_idx = torch.argsort(est_eig, descending=True)
             exp_avg_sq = exp_avg_sq.index_select(ind, sort_idx)
 
-            power_iter = m @ o[:, sort_idx]
+            power_iter = matrix_product.index_select(1, sort_idx)
 
             # Compute QR decomposition
             # We cast to float32 because:
@@ -217,8 +222,8 @@ class SOAP(BaseOptimizer):
 
         return matrices
 
-    @staticmethod
     def init_pre_conditioner(
+        self,
         grad,
         state,
         precondition_frequency: int = 10,
@@ -235,7 +240,7 @@ class SOAP(BaseOptimizer):
                 state['GG'].append(torch.zeros(grad.shape[0], grad.shape[0], device=grad.device, dtype=grad.dtype))
         else:
             if merge_dims:
-                grad = grad.reshape(merge_small_dims(grad.size(), max_precondition_dim))
+                grad = self.merge_dims(grad, max_precondition_dim)
 
             for sh in grad.shape:
                 if sh > max_precondition_dim:
@@ -264,7 +269,7 @@ class SOAP(BaseOptimizer):
                 )
         else:
             if merge_dims:
-                grad = grad.reshape(merge_small_dims(grad.size(), max_precondition_dim))
+                grad = self.merge_dims(grad, max_precondition_dim)
 
             for idx, dim in enumerate(grad.shape):
                 if dim <= max_precondition_dim:
@@ -300,10 +305,11 @@ class SOAP(BaseOptimizer):
 
             beta1, beta2 = group['betas']
 
+            step: int = group['step'] - 1
             step_size: float = group['lr']
             if group['correct_bias']:
-                bias_correction1: float = self.debias(beta1, group['step'])
-                bias_correction2_sq: float = math.sqrt(self.debias(beta2, group['step']))
+                bias_correction1: float = self.debias(beta1, step)
+                bias_correction2_sq: float = math.sqrt(self.debias(beta2, step))
 
                 step_size *= bias_correction2_sq / bias_correction1
 
@@ -323,8 +329,8 @@ class SOAP(BaseOptimizer):
 
                 exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
 
-                exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-                exp_avg_sq.mul_(beta2).add_(grad_projected.square(), alpha=1.0 - beta2)
+                exp_avg.lerp_(grad, weight=1.0 - beta1)
+                exp_avg_sq.lerp_(grad_projected.square(), weight=1.0 - beta2)
 
                 de_nom = exp_avg_sq.sqrt().add_(group['eps'])
 
@@ -357,7 +363,7 @@ class SOAP(BaseOptimizer):
                 self.update_pre_conditioner(
                     grad,
                     state,
-                    step=group['step'],
+                    step=step,
                     max_precondition_dim=group['max_precondition_dim'],
                     merge_dims=group['merge_dims'],
                     precondition_1d=group['precondition_1d'],

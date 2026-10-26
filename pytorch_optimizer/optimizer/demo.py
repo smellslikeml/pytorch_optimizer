@@ -1,6 +1,5 @@
 import math
 from importlib.util import find_spec
-from typing import List, Optional
 
 import torch
 from torch.distributed import ProcessGroup, all_gather, get_world_size
@@ -8,6 +7,7 @@ from torch.distributed import ProcessGroup, all_gather, get_world_size
 from pytorch_optimizer.base.exception import NoComplexParameterError, NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Closure, Loss, ParamsT
+from pytorch_optimizer.optimizer.utils.foreach import group_tensors_by_device_and_dtype
 
 HAS_EINOPS: bool = find_spec('einops') is not None
 
@@ -16,7 +16,7 @@ if HAS_EINOPS:  # pragma: ignore
 
 
 class TransformDCT:
-    """TransformDCT."""
+    """Encode and decode tensors with blockwise discrete cosine transforms."""
 
     @torch.no_grad()
     def __init__(self, param_groups, target_chunk, norm: str = 'ortho'):
@@ -37,19 +37,21 @@ class TransformDCT:
                     sc = get_smaller_split(s, self.target_chunk)
                     self.shape_dict[s] = sc
 
-                    if sc not in self.f_dict:
+                    key = (sc, p.device, p.dtype)
+
+                    if key not in self.f_dict:
                         i = torch.eye(sc)
-                        self.f_dict[sc] = dct(i, norm=norm).to(p.dtype).to(p.device)
-                        self.b_dict[sc] = inverse_dct(i, norm=norm).to(p.dtype).to(p.device)
+                        self.f_dict[key] = dct(i, norm=norm).to(device=p.device, dtype=p.dtype)
+                        self.b_dict[key] = inverse_dct(i, norm=norm).to(device=p.device, dtype=p.dtype)
 
     @torch.no_grad()
-    def einsum_2d(self, x: torch.Tensor, b: torch.Tensor, d: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def einsum_2d(self, x: torch.Tensor, b: torch.Tensor, d: torch.Tensor | None = None) -> torch.Tensor:
         if d is None:
             return torch.einsum('...ij, jb -> ...ib', x, b)
         return torch.einsum('...ijkl, jb, ld -> ...ikbd', x, b, d)
 
     @torch.no_grad()
-    def einsum_2d_t(self, x: torch.Tensor, b: torch.Tensor, d: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def einsum_2d_t(self, x: torch.Tensor, b: torch.Tensor, d: torch.Tensor | None = None) -> torch.Tensor:
         if d is None:
             return torch.einsum('...ij, jb -> ...ib', x, b)
         return torch.einsum('...ijkl, kb, ld -> ...ibjd', x, b, d)
@@ -57,13 +59,11 @@ class TransformDCT:
     @torch.no_grad()
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         n1 = self.shape_dict[x.shape[0]]
-        n1w = self.f_dict[n1].to(x.device)
-        self.f_dict[n1] = n1w
+        n1w = self.f_dict[(n1, x.device, x.dtype)]
 
         if len(x.shape) > 1:
             n2 = self.shape_dict[x.shape[1]]
-            n2w = self.f_dict[n2].to(x.device)
-            self.f_dict[n2] = n2w
+            n2w = self.f_dict[(n2, x.device, x.dtype)]
 
             x = rearrange(x, '(y h) (x w) -> y h x w', h=n1, w=n2)
             return self.einsum_2d(x, n1w, n2w)
@@ -76,24 +76,21 @@ class TransformDCT:
         if len(x.shape) > 2:
             n1 = x.shape[2]
             n2 = x.shape[3]
-            n1w = self.b_dict[n1].to(x.device)
-            n2w = self.b_dict[n2].to(x.device)
-            self.b_dict[n1] = n1w
-            self.b_dict[n2] = n2w
+            n1w = self.b_dict[(n1, x.device, x.dtype)]
+            n2w = self.b_dict[(n2, x.device, x.dtype)]
 
             x = self.einsum_2d_t(x, n1w, n2w)
             return rearrange(x, 'y h x w -> (y h) (x w)')
 
         n1 = x.shape[1]
-        n1w = self.b_dict[n1].to(x.device)
-        self.b_dict[n1] = n1w
+        n1w = self.b_dict[(n1, x.device, x.dtype)]
 
         x = self.einsum_2d_t(x, n1w)
         return rearrange(x, 'x w -> (x w)')
 
 
 class CompressDCT:
-    """CompressDCT."""
+    """Compress DCT coefficients by retaining the largest magnitudes."""
 
     @torch.no_grad()
     def __init__(self):
@@ -140,15 +137,15 @@ class CompressDCT:
         return self.decompress(p, idx, val, shape)
 
 
-def dct(x: torch.Tensor, norm: Optional[str] = None) -> torch.Tensor:
-    """Discrete Cosine Transform, Type II (a.k.a. the DCT).
+def dct(x: torch.Tensor, norm: str | None = None) -> torch.Tensor:
+    """Compute the type II discrete cosine transform along the last dimension.
 
     For the meaning of the parameter `norm`, see:
     https://docs.scipy.org/doc/scipy-0.14.0/reference/generated/scipy.fftpack.dct.html
 
     Args:
-        x (torch.Tensor): The input signal.
-        norm (Optional[str]): The normalization, either None or 'ortho'.
+        x: The input signal.
+        norm: The normalization, either None or 'ortho'.
 
     Returns:
         torch.Tensor: The DCT-II of the signal over the last dimension.
@@ -176,15 +173,15 @@ def dct(x: torch.Tensor, norm: Optional[str] = None) -> torch.Tensor:
     return 2 * v.view(*x_shape)
 
 
-def inverse_dct(x: torch.Tensor, norm: Optional[str] = None) -> torch.Tensor:
-    """Get the inverse to DCT-II, which is a scaled Discrete Cosine Transform, Type III.
+def inverse_dct(x: torch.Tensor, norm: str | None = None) -> torch.Tensor:
+    """Compute the inverse type II discrete cosine transform along the last dimension.
 
     For the meaning of the parameter `norm`, see:
     https://docs.scipy.org/doc/scipy-0.14.0/reference/generated/scipy.fftpack.dct.html
 
     Args:
-        x (torch.Tensor): The input signal.
-        norm (Optional[str]): The normalization, None or 'ortho'.
+        x: The input signal.
+        norm: The normalization, None or 'ortho'.
 
     Returns:
         torch.Tensor: The inverse DCT-II of the signal over the last dimension.
@@ -219,8 +216,8 @@ def inverse_dct(x: torch.Tensor, norm: Optional[str] = None) -> torch.Tensor:
     return x.view(*x_shape)
 
 
-def get_prime_divisors(n: int) -> List[int]:
-    """Get prime divisors."""
+def get_prime_divisors(n: int) -> list[int]:
+    """Return prime factors, including repeated factors."""
     divisors = []
 
     while n % 2 == 0:
@@ -245,8 +242,8 @@ def get_prime_divisors(n: int) -> List[int]:
     return divisors
 
 
-def get_divisors(n: int) -> List[int]:
-    """Get divisors."""
+def get_divisors(n: int) -> list[int]:
+    """Return the sorted positive divisors of an integer."""
     divisors = []
 
     if n == 1:
@@ -276,7 +273,7 @@ def get_divisors(n: int) -> List[int]:
 
 
 def get_smaller_split(n: int, close_to: int) -> int:
-    """Get smaller split."""
+    """Return the largest divisor no greater than the requested split size."""
     all_divisors = get_divisors(n)
     for ix, val in enumerate(all_divisors):
         if val == close_to:
@@ -289,16 +286,18 @@ def get_smaller_split(n: int, close_to: int) -> int:
 
 
 class DeMo(torch.optim.SGD, BaseOptimizer):  # pragma: no cover
-    """Decoupled Momentum Optimization.
+    """SGD with compressed distributed momentum exchange.
 
     Args:
-        params (ParamsT): Iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): Learning rate.
-        compression_decay (float): Compression decay.
-        compression_top_k (int): Compression top-k.
-        compression_chunk (int): Compression chunk size.
-        weight_decay (float): Weight decay (L2 penalty).
-        maximize (bool): Maximize the objective with respect to the parameters, instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        compression_decay: Decay rate for the residual momentum buffer.
+        compression_top_k: Maximum DCT coefficients to retain per block.
+        compression_chunk: Maximum size of each DCT block dimension.
+        process_group: Distributed process group for compressed gradient exchange. `None` uses the default group.
+        weight_decay: Weight decay coefficient.
+        maximize: Maximize the objective instead of minimizing it.
+        foreach: Batch the final SGD update. `None` enables batching on CUDA.
 
     """
 
@@ -310,8 +309,9 @@ class DeMo(torch.optim.SGD, BaseOptimizer):  # pragma: no cover
         compression_top_k: int = 32,
         compression_chunk: int = 64,
         weight_decay: float = 0.0,
-        process_group: Optional[ProcessGroup] = None,
+        process_group: ProcessGroup | None = None,
         maximize: bool = False,
+        foreach: bool | None = None,
         **kwargs,
     ):
         self.validate_learning_rate(lr)
@@ -335,16 +335,15 @@ class DeMo(torch.optim.SGD, BaseOptimizer):  # pragma: no cover
         super().__init__(
             params,
             lr=lr,
-            foreach=False,
+            foreach=foreach,
             momentum=0.0,
             dampening=0.0,
             nesterov=False,
             maximize=False,
-            weight_decay=0.0,
+            weight_decay=weight_decay,
             **kwargs,
         )
 
-        self.demo_state = {}
         self.init_demo_states()
         self.init_parameters()
 
@@ -356,12 +355,23 @@ class DeMo(torch.optim.SGD, BaseOptimizer):  # pragma: no cover
         return 'DeMo'
 
     def find_dtype(self) -> torch.dtype:
-        r"""Return dtype of the parameter."""
+        """Return the data type of the first optimizer parameter."""
         for group in self.param_groups:
             for p in group['params']:
                 if p.requires_grad:
                     return p.dtype
         return torch.float32
+
+    @property
+    def demo_state(self):
+        return self.state
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+
+        for group in self.param_groups:
+            for p in group['params']:
+                self.state[p].setdefault('delta', torch.zeros_like(p))
 
     def init_demo_states(self) -> None:
         for group in self.param_groups:
@@ -398,8 +408,15 @@ class DeMo(torch.optim.SGD, BaseOptimizer):  # pragma: no cover
 
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
+        loss = None
+
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
         self.data_transmit = 0
         self.data_receive = 0
+        params, values, indices, shapes = [], [], [], []
 
         for group in self.param_groups:
             if 'step' in group:
@@ -428,7 +445,7 @@ class DeMo(torch.optim.SGD, BaseOptimizer):  # pragma: no cover
                     p,
                     grad,
                     lr=lr,
-                    weight_decay=self.weight_decay,
+                    weight_decay=group['weight_decay'],
                     weight_decouple=True,
                     fixed_decay=False,
                 )
@@ -446,21 +463,54 @@ class DeMo(torch.optim.SGD, BaseOptimizer):  # pragma: no cover
 
                 state['delta'].sub_(transmit_grad)
 
-                sparse_idx_gather, sparse_val_gather = self.demo_all_gather(sparse_idx, sparse_val)
+                world_size = get_world_size() if self.process_group is None else self.process_group.size()
 
-                self.data_transmit += sparse_idx.nbytes + sparse_val.nbytes
-                for si, v in zip(sparse_idx_gather, sparse_val_gather):
-                    self.data_receive += si.nbytes + v.nbytes
+                if world_size == 1:
+                    self.data_transmit += sparse_idx.nbytes + sparse_val.nbytes
+                    self.data_receive += sparse_idx.nbytes + sparse_val.nbytes
+                    p.grad.copy_(transmit_grad).sign_()
+                    continue
 
+                params.append(p)
+                values.append(sparse_val)
+                indices.append(sparse_idx)
+                shapes.append(x_shape)
+
+        for batch in group_tensors_by_device_and_dtype(params, values, {'sparse_indices': indices}):
+            sizes = [value.numel() for value in batch['grads']]
+            packed_indices = torch.cat([index.reshape(-1) for index in batch['sparse_indices']])
+            packed_values = torch.cat([value.reshape(-1) for value in batch['grads']])
+
+            gathered_indices, gathered_values = self.demo_all_gather(packed_indices, packed_values)
+
+            self.data_transmit += packed_indices.nbytes + packed_values.nbytes
+            self.data_receive += sum(
+                index.nbytes + value.nbytes for index, value in zip(gathered_indices, gathered_values)
+            )
+
+            split_indices = [index.split(sizes) for index in gathered_indices]
+            split_values = [value.split(sizes) for value in gathered_values]
+
+            for offset, (p, sparse_value, original_index) in enumerate(
+                zip(batch['params'], batch['grads'], batch['indices'])
+            ):
+                shape = sparse_value.shape
+                sparse_indices = [parts[offset].reshape(shape) for parts in split_indices]
+                sparse_values = [parts[offset].reshape(shape) for parts in split_values]
                 new_grad = self.transform.decode(
-                    self.compress.batch_decompress(p, sparse_idx_gather, sparse_val_gather, x_shape)
+                    self.compress.batch_decompress(p, sparse_indices, sparse_values, shapes[original_index])
                 )
+                p.grad.copy_(new_grad).sign_()
 
-                if p.grad is None:
-                    p.grad = new_grad
-                else:
-                    p.grad.copy_(new_grad)
+        decays = [group['weight_decay'] for group in self.param_groups]
 
-                p.grad.sign_()
+        try:
+            for group in self.param_groups:
+                group['weight_decay'] = 0.0
 
-        return super().step(closure)
+            super().step()
+        finally:
+            for group, decay in zip(self.param_groups, decays):
+                group['weight_decay'] = decay
+
+        return loss

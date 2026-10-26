@@ -1,7 +1,7 @@
 # ruff: noqa
 import fnmatch
+from collections.abc import Sequence
 from enum import Enum
-from typing import Dict, List, Optional, Sequence, Set, Union
 
 from torch.optim.lr_scheduler import (
     ConstantLR,
@@ -22,6 +22,29 @@ from pytorch_optimizer.lr_scheduler.linear_warmup import CosineScheduler, Linear
 from pytorch_optimizer.lr_scheduler.proportion import ProportionScheduler
 from pytorch_optimizer.lr_scheduler.rex import REXScheduler
 from pytorch_optimizer.lr_scheduler.wsd import get_wsd_schedule
+
+__all__ = [
+    'ConstantLR',
+    'CosineAnnealingLR',
+    'CosineAnnealingWarmRestarts',
+    'CosineAnnealingWarmupRestarts',
+    'CosineScheduler',
+    'CyclicLR',
+    'LinearScheduler',
+    'MultiStepLR',
+    'MultiplicativeLR',
+    'OneCycleLR',
+    'PolyScheduler',
+    'ProportionScheduler',
+    'REXScheduler',
+    'StepLR',
+    'deberta_v3_large_lr_scheduler',
+    'get_chebyshev_perm_steps',
+    'get_chebyshev_schedule',
+    'get_supported_lr_schedulers',
+    'get_wsd_schedule',
+    'load_lr_scheduler',
+]
 
 
 class SchedulerType(Enum):
@@ -46,7 +69,7 @@ class SchedulerType(Enum):
         return self.value
 
 
-LR_SCHEDULER_LIST: Dict = {
+LR_SCHEDULER_LIST: dict = {
     SchedulerType.CONSTANT: ConstantLR,
     SchedulerType.STEP: StepLR,
     SchedulerType.MULTI_STEP: MultiStepLR,
@@ -64,15 +87,23 @@ LR_SCHEDULER_LIST: Dict = {
     SchedulerType.REX: REXScheduler,
     SchedulerType.WARMUP_STABLE_DECAY: get_wsd_schedule,
 }
-LR_SCHEDULERS: Dict[str, SchedulerClass] = {
+LR_SCHEDULERS: dict[str, SchedulerClass] = {
     str(lr_scheduler_name).lower(): lr_scheduler for lr_scheduler_name, lr_scheduler in LR_SCHEDULER_LIST.items()
 }
 
 
 def load_lr_scheduler(lr_scheduler_name: str) -> SchedulerClass:
-    r"""Load learning rate scheduler.
+    """Return a learning rate scheduler class by name.
 
-    :param lr_scheduler_name: learning rate scheduler name.
+    Args:
+        lr_scheduler_name: Case insensitive name from `get_supported_lr_schedulers()`.
+
+    Returns:
+        Scheduler: Registered scheduler class.
+
+    Raises:
+        NotImplementedError: The scheduler name is unsupported.
+
     """
     lrs_name: str = lr_scheduler_name.lower()
 
@@ -82,18 +113,21 @@ def load_lr_scheduler(lr_scheduler_name: str) -> SchedulerClass:
     return LR_SCHEDULERS[lrs_name]
 
 
-def get_supported_lr_schedulers(filters: Optional[Union[str, List[str]]] = None) -> List[str]:
-    r"""Return list of available lr scheduler names, sorted alphabetically.
+def get_supported_lr_schedulers(filters: str | list[str] | None = None) -> list[str]:
+    """List registered scheduler names in alphabetical order.
 
-    :param filters: Optional[Union[str, List[str]]]. wildcard filter string that works with fmatch. if None, it will
-        return the whole list.
+    Args:
+        filters: Wildcard pattern or list of patterns, such as `'*cosine*'`. `None` selects all names.
+
+    Returns:
+        list[str]: Matching names in lowercase, without duplicates.
     """
     if filters is None:
         return sorted(LR_SCHEDULERS.keys())
 
     include_filters: Sequence[str] = filters if isinstance(filters, (tuple, list)) else [filters]
 
-    filtered_list: Set[str] = set()
+    filtered_list: set[str] = set()
     for include_filter in include_filters:
         filtered_list.update(fnmatch.filter(LR_SCHEDULERS.keys(), include_filter))
 

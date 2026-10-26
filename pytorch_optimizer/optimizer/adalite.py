@@ -7,21 +7,21 @@ from pytorch_optimizer.base.type import Betas, Closure, Defaults, Loss, ParamGro
 
 
 class Adalite(BaseOptimizer):
-    r"""Adalite optimizer.
+    """Adaptive updates with factored moments and tensor wise trust ratios.
 
     Args:
-        params (ParamsT): Iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): Learning rate.
-        betas (Betas): Coefficients used for computing running averages of gradient and the squared Hessian trace.
-        weight_decay (float): Weight decay (L2 penalty).
-        weight_decouple (bool): The optimizer uses decoupled weight decay as in AdamW.
-        fixed_decay (bool): Fix weight decay.
-        g_norm_min (float): Minimum gradient norm threshold.
-        ratio_min (float): Minimum ratio value for adaptive adjustment.
-        tau (float): Time constant controlling parameter smoothing or decay behavior.
-        eps1 (float): Term added to the denominator to improve numerical stability.
-        eps2 (float): Additional term added to the denominator for extra numerical stability.
-        maximize (bool): Maximize the objective with respect to the parameters, instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        betas: Decay rates for the first and second moments.
+        weight_decay: Weight decay coefficient.
+        weight_decouple: Apply weight decay to parameters instead of adding it to the gradient.
+        fixed_decay: Apply decoupled weight decay without scaling it by the learning rate.
+        g_norm_min: Lower bound for the gradient norm in the trust ratio.
+        ratio_min: Lower bound for the parameter-to-gradient norm ratio.
+        tau: Softmax temperature for row and column importance weights.
+        eps1: Stability constant for adaptive updates.
+        eps2: Lower bound for factored moment normalization denominators.
+        maximize: Maximize the objective instead of minimizing it.
 
     """
 
@@ -31,7 +31,7 @@ class Adalite(BaseOptimizer):
         lr: float = 1e-3,
         betas: Betas = (0.9, 0.999),
         weight_decay: float = 1e-2,
-        weight_decouple: bool = False,
+        weight_decouple: bool = True,
         fixed_decay: bool = False,
         g_norm_min: float = 1e-10,
         ratio_min: float = 1e-4,
@@ -86,16 +86,18 @@ class Adalite(BaseOptimizer):
             state = self.state[p]
 
             if len(state) == 0:
+                matrix = p.reshape(p.size(0), -1) if p.ndim > 2 else p
+
                 if len(p.shape) < 2:
                     state['m_avg'] = torch.zeros_like(p)
                     state['v_avg'] = torch.zeros_like(p)
                 else:
-                    state['v_avg_0'] = torch.zeros_like(p.mean(dim=1))
-                    state['v_avg_1'] = torch.zeros_like(p.mean(dim=0))
+                    state['v_avg_0'] = torch.zeros_like(matrix.mean(dim=1))
+                    state['v_avg_1'] = torch.zeros_like(matrix.mean(dim=0))
 
-                    state['m_avg_c'] = torch.zeros_like(p.mean(dim=1)[:, None])
-                    state['m_avg_r'] = torch.zeros_like(p.mean(dim=0)[None, :])
-                    state['m_avg_u'] = torch.zeros_like(p.mean().unsqueeze(0).unsqueeze(0))
+                    state['m_avg_c'] = torch.zeros_like(matrix.mean(dim=1)[:, None])
+                    state['m_avg_r'] = torch.zeros_like(matrix.mean(dim=0)[None, :])
+                    state['m_avg_u'] = torch.zeros_like(matrix.mean().unsqueeze(0).unsqueeze(0))
 
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
@@ -116,9 +118,17 @@ class Adalite(BaseOptimizer):
 
                 grad = p.grad
 
+                if grad.ndim > 2:
+                    grad = grad.reshape(grad.size(0), -1)
+
                 self.maximize_gradient(grad, maximize=self.maximize)
 
                 state = self.state[p]
+
+                if not group['weight_decouple']:
+                    self.apply_weight_decay(
+                        p.reshape_as(grad), grad, group['lr'], group['weight_decay'], False, group['fixed_decay']
+                    )
 
                 if sum(grad.shape) > 1:
                     trust_ratio = (p.norm() / grad.norm().clip(min=group['g_norm_min'])).clip(min=group['ratio_min'])
@@ -138,8 +148,9 @@ class Adalite(BaseOptimizer):
                 v_avg = v / (1.0 - beta2 ** group['step'])
 
                 if len(grad.shape) == 2:
-                    imp_c = softmax(v.mean(dim=1), dim=0)[:, None]
-                    imp_r = softmax(v.mean(dim=0), dim=0)[None, :]
+                    row_mean, column_mean = v.mean(dim=1), v.mean(dim=0)
+                    imp_c = softmax(row_mean, dim=0)[:, None]
+                    imp_r = softmax(column_mean, dim=0)[None, :]
                     m.lerp_(grad, 1.0 - imp_c * imp_r)
 
                 u = m.lerp(grad, 1.0 - beta1)
@@ -151,13 +162,13 @@ class Adalite(BaseOptimizer):
                     state['v_avg_0'] = v.sum(dim=1)
                     state['v_avg_1'] = v.sum(dim=0) / v.sum().clamp(min=group['eps2'])
 
-                    imp_c = softmax(v.mean(dim=1) / group['tau'], dim=-1)[:, None]
-                    imp_r = softmax(v.mean(dim=0) / group['tau'], dim=-1)[None, :]
+                    imp_c = softmax(row_mean / group['tau'], dim=-1)[:, None]
+                    imp_r = softmax(column_mean / group['tau'], dim=-1)[None, :]
 
                     c = ((m * imp_r).sum(dim=1))[:, None]
                     r = ((m * imp_c).sum(dim=0))[None, :]
 
-                    s = (c.T @ m @ r.T) / (c.T @ c @ r @ r.T).clamp(min=group['eps2'])
+                    s = (c.T @ m @ r.T) / (c.square().sum() * r.square().sum()).clamp(min=group['eps2'])
 
                     state['m_avg_c'] = c
                     state['m_avg_r'] = r
@@ -166,7 +177,11 @@ class Adalite(BaseOptimizer):
                 u.div_((v_avg + group['eps1']).sqrt())
 
                 u = u.reshape(p.shape)
-                u.add_(p, alpha=group['weight_decay'])
+
+                if group['weight_decouple']:
+                    self.apply_weight_decay(
+                        p, None, group['lr'], group['weight_decay'], True, group['fixed_decay']
+                    )
 
                 p.add_(u, alpha=-group['lr'])
 

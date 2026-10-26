@@ -1,8 +1,10 @@
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Tuple, Union
+from textwrap import fill
+from typing import Any
 from warnings import filterwarnings
 
 import numpy as np
@@ -18,7 +20,7 @@ from pytorch_optimizer.optimizer.alig import l2_projection
 
 filterwarnings('ignore', category=UserWarning)
 
-OPTIMIZERS_IGNORE: Tuple[str, ...] = (
+OPTIMIZERS_IGNORE: tuple[str, ...] = (
     'lomo',
     'adalomo',
     'demo',
@@ -30,15 +32,17 @@ OPTIMIZERS_IGNORE: Tuple[str, ...] = (
     'adamuon',
     'adago',
     'distributedmuon',
+    'normuon',
+    'spectralsphere',
     'splus',
     'lbfgs',
 )
-OPTIMIZERS_MODEL_INPUT_NEEDED: Tuple[str, ...] = ('lomo', 'adalomo', 'adammini', 'adago')
-OPTIMIZERS_GRAPH_NEEDED: Tuple[str, ...] = ('adahessian', 'sophiah')
-OPTIMIZERS_CLOSURE_NEEDED: Tuple[str, ...] = ('alig', 'bsam')
+OPTIMIZERS_MODEL_INPUT_NEEDED: tuple[str, ...] = ('lomo', 'adalomo', 'adammini', 'adago')
+OPTIMIZERS_GRAPH_NEEDED: tuple[str, ...] = ('adahessian', 'sophiah')
+OPTIMIZERS_CLOSURE_NEEDED: tuple[str, ...] = ('alig', 'bsam')
 
-DEFAULT_SEARCH_SPACES: Dict = {'lr': hp.uniform('lr', 0, 2)}
-SPECIAL_SEARCH_SPACES: Dict = {
+DEFAULT_SEARCH_SPACES: dict = {'lr': hp.uniform('lr', 0, 2)}
+SPECIAL_SEARCH_SPACES: dict = {
     'adafactor': {'lr': hp.uniform('lr', 0, 10)},
     'adams': {'lr': hp.uniform('lr', 0, 10)},
     'dadaptadagrad': {'lr': hp.uniform('lr', 0, 10)},
@@ -116,20 +120,18 @@ SPECIAL_SEARCH_SPACES: Dict = {
 class Settings:
     evals_per_param: int = 600
     opt_steps: int = 200
-    test_steps: Dict[str, int] = field(default_factory=lambda: {'rastrigin': 150, 'rosenbrock': 400})
+    test_steps: dict[str, int] = field(default_factory=lambda: {'rastrigin': 150, 'rosenbrock': 400})
     difficult_rastrigin: bool = False
-    penalties: Dict[str, float] = field(
+    penalties: dict[str, float] = field(
         default_factory=lambda: {'convergence': 0.2, 'oscillations': 0.1, 'average': 0.4},
     )
     loss_min_threshold: float = 0.0
-    fig_size: Tuple[int, int] = (6, 6)
+    fig_size: tuple[float, float] = (5.12, 5.12)
     grid_points: int = 150
-    savefig_kwargs: Dict[str, Any] = field(
+    savefig_kwargs: dict[str, Any] = field(
         default_factory=lambda: {
-            'dpi': 120,
-            'bbox_inches': 'tight',
-            'pad_inches': 0.05,
-            'pil_kwargs': {'quality': 75, 'optimize': True, 'subsampling': 2},
+            'dpi': 100,
+            'pil_kwargs': {'quality': 70, 'optimize': True, 'subsampling': 2},
         }
     )
     seed: int = 42
@@ -142,10 +144,10 @@ SETTINGS = Settings()
 class ExperimentConfig:
     name: str
     func: Callable
-    initial_state: Tuple[float, float]
-    x_range: Tuple[float, float]
-    y_range: Tuple[float, float]
-    minimum: Tuple[float, float]
+    initial_state: tuple[float, float]
+    x_range: tuple[float, float]
+    y_range: tuple[float, float]
+    minimum: tuple[float, float]
     steps: int
 
 
@@ -154,7 +156,7 @@ class Model(nn.Module):
     Simple 2D optimization model maintaining state for parameters being optimized.
     """
 
-    def __init__(self, func: Callable, initial_state: Tuple[float, float]) -> None:
+    def __init__(self, func: Callable, initial_state: tuple[float, float]) -> None:
         """
         Args:
             func: Objective function to optimize.
@@ -179,7 +181,7 @@ class Visualizer:
 
     def __init__(
         self,
-        optimizers: Tuple[Tuple[Optimizer, Dict[str, Any]], ...],
+        optimizers: tuple[tuple[type[Optimizer], dict[str, Any]], ...],
         output_dir: Path,
         seed: int = SETTINGS.seed,
     ) -> None:
@@ -242,14 +244,14 @@ class Visualizer:
                 experiment.steps,
             )
 
-    def run_experiments(self, experiments: List[ExperimentConfig]) -> None:
+    def run_experiments(self, experiments: list[ExperimentConfig]) -> None:
         for experiment in experiments:
             print(f'Running {experiment.name} experiment')
             self.run_experiment(experiment)
 
 
 def ackley(
-    x: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], a: float = 20.0, b: float = 0.2, c: float = 2.0 * np.pi
+    x: tuple[torch.Tensor, torch.Tensor] | torch.Tensor, a: float = 20.0, b: float = 0.2, c: float = 2.0 * np.pi
 ) -> torch.Tensor:
     """
     Ackley function (non-convex, global minimum at (0, 0)).
@@ -268,7 +270,7 @@ def ackley(
     return sum_sq + cos + np.exp(1) + a
 
 
-def rosenbrock(x: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]) -> torch.Tensor:
+def rosenbrock(x: tuple[torch.Tensor, torch.Tensor] | torch.Tensor) -> torch.Tensor:
     """
     Rosenbrock function (non-convex, global minimum at (1, 1)).
 
@@ -282,7 +284,7 @@ def rosenbrock(x: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]) -> tor
 
 
 def rastrigin(
-    x: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
+    x: tuple[torch.Tensor, torch.Tensor] | torch.Tensor,
     a: float = 10.0,
     add_noise: bool = SETTINGS.difficult_rastrigin,
     noise_scale: float = 0.1,
@@ -310,11 +312,11 @@ def rastrigin(
 
 def execute_steps(
     func: Callable,
-    initial_state: Tuple[float, float],
-    optimizer_class: Optimizer,
-    optimizer_config: Dict[str, Any],
+    initial_state: tuple[float, float],
+    optimizer_class: type[Optimizer],
+    optimizer_config: dict[str, Any],
     num_iters: int = 500,
-) -> Tuple[torch.Tensor, List[float]]:
+) -> tuple[torch.Tensor, list[float]]:
     """Execute optimization steps for a given configuration.
 
     Args:
@@ -350,8 +352,6 @@ def execute_steps(
 
     if optimizer_name == 'ranger21':
         optimizer_config['num_iterations'] = num_iters
-    elif optimizer_name == 'ranger25':
-        optimizer_config['orthograd'] = False
     elif optimizer_name == 'adashift':
         optimizer_config['keep_num'] = 1
     elif optimizer_name == 'alig':
@@ -360,7 +360,8 @@ def execute_steps(
         optimizer_config['num_data'] = 1
 
     optimizer = optimizer_class(
-        model if optimizer_name in OPTIMIZERS_MODEL_INPUT_NEEDED else parameters, **optimizer_config
+        model if optimizer_name in OPTIMIZERS_MODEL_INPUT_NEEDED else parameters,
+        **optimizer_config,
     )
 
     steps = torch.zeros((2, num_iters + 1), dtype=torch.float32)
@@ -386,13 +387,13 @@ def execute_steps(
 
 
 def objective(
-    params: Dict[str, Any],
+    params: dict[str, Any],
     criterion: Callable,
-    optimizer_class: Optimizer,
-    initial_state: Tuple[float, float],
-    minimum: Tuple[float, float],
-    x_bounds: Tuple[float, float],
-    y_bounds: Tuple[float, float],
+    optimizer_class: type[Optimizer],
+    initial_state: tuple[float, float],
+    minimum: tuple[float, float],
+    x_bounds: tuple[float, float],
+    y_bounds: tuple[float, float],
     num_iters: int = 100,
 ) -> float:
     """Objective function for hyperparameter optimization evaluating multiple performance metrics.
@@ -442,10 +443,10 @@ def plot_function(
     optimization_steps: torch.Tensor,
     output_path: Path,
     optimizer_name: str,
-    params: Dict,
-    x_range: Tuple[float, float],
-    y_range: Tuple[float, float],
-    minimum: Tuple[float, float],
+    params: dict,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    minimum: tuple[float, float],
     iterations: int,
 ) -> None:
     """
@@ -471,15 +472,23 @@ def plot_function(
     ax = fig.add_subplot(1, 1, 1)
 
     ax.contour(x_grid.numpy(), y_grid.numpy(), z.numpy(), 20, cmap='jet')
-    ax.plot(optimization_steps[0], optimization_steps[1], color='r', marker='x', markersize=3)
+    ax.plot(
+        optimization_steps[0],
+        optimization_steps[1],
+        color='r',
+        marker='x',
+        markersize=3,
+        markevery=max(1, iterations // 30),
+    )
 
     plt.plot(*minimum, 'gD', label='Global Minimum')
     plt.plot(optimization_steps[0, -1], optimization_steps[1, -1], 'bD', label='Final Position')
 
     config: str = ', '.join(f'{k}={round(v, 4)}' for k, v in params.items())
-    ax.set_title(f'{func.__name__} func: {optimizer_name} with {iterations} iterations\n{config}')
+    ax.set_title(f'{func.__name__}: {optimizer_name}, {iterations} steps\n{fill(config, width=60)}', fontsize=9)
 
     plt.legend()
+    fig.tight_layout()
     plt.savefig(str(output_path), **SETTINGS.savefig_kwargs)
     plt.close()
 
@@ -496,7 +505,7 @@ def main():
         if optimizer_name not in OPTIMIZERS_IGNORE
     )
 
-    experiments: List[ExperimentConfig] = [
+    experiments: list[ExperimentConfig] = [
         ExperimentConfig(
             name='rastrigin',
             func=rastrigin,

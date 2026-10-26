@@ -1,46 +1,49 @@
-from typing import Literal, Optional
+from typing import Literal
 
 import torch
 
 from pytorch_optimizer.base.exception import NoComplexParameterError, NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Closure, Defaults, Loss, ParamGroup, ParamsT
+from pytorch_optimizer.optimizer.utils.foreach import foreach_addcdiv_, group_tensors_by_device_and_dtype
 
 Mode = Literal['g', 'm', 'c']
 
 
 class BCOS(BaseOptimizer):
-    """Stochastic Approximation with Block Coordinate Optimal Stepsizes.
+    """Stochastic approximation with block coordinate optimal step sizes.
 
     Args:
-        params (ParamsT): Iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): Learning rate.
-        beta (float): smoothing factor in computing the momentum and EMA estimators.
-        beta2 (Optional[float]):
-        mode (Mode): algorithmic mode of BCOS, must be one of the three choices.
-            'g': use gradient as search direction and EMA estimator for its 2nd moment (equivalent to RMSprop).
-            'm': use momentum as search direction and EMA estimator for its 2nd moment (using same beta).
-            'c': use momentum as search direction and conditional estimator for its 2nd moment.
-        simple_cond (bool): whether use simple alternative in BCOS-c variant.
-        weight_decay (float): weight decay regularization strength.
-        weight_decouple (bool): The optimizer uses decoupled weight decay as in AdamW.
-        eps (float): Term added to the denominator to improve numerical stability.
-        maximize (bool): Maximize the objective with respect to the parameters, instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        beta: Decay rate for momentum and its second moment estimator.
+        beta2: Separate second moment decay rate. `None` uses `beta`.
+        mode: Search direction and estimator: `'g'` for gradients, `'m'` for momentum, or `'c'` for conditional
+            momentum.
+        simple_cond: Use the simplified conditional estimator in mode `c`.
+        weight_decay: Weight decay coefficient.
+        weight_decouple: Apply weight decay to parameters instead of adding it to the gradient.
+        eps: Term added to the denominator to improve numerical stability.
+        maximize: Maximize the objective instead of minimizing it.
+        foreach: Use batched tensor operations. `None` enables them for supported parameter groups.
 
     """
+
+    _supports_compiled_foreach = True
 
     def __init__(
         self,
         params: ParamsT,
-        lr: float = 1e-3,
+        lr: float | torch.Tensor = 1e-3,
         beta: float = 0.9,
-        beta2: Optional[float] = None,
+        beta2: float | None = None,
         mode: Mode = 'c',
         simple_cond: bool = False,
         weight_decay: float = 0.1,
         weight_decouple: bool = True,
         eps: float = 1e-6,
         maximize: bool = False,
+        foreach: bool | None = None,
         **kwargs,
     ):
         self.validate_learning_rate(lr)
@@ -52,12 +55,14 @@ class BCOS(BaseOptimizer):
         self.mode = mode
         self.simple_cond = simple_cond
         self.maximize = maximize
+        self.foreach = foreach
 
         defaults: Defaults = {
             'lr': lr,
             'beta': beta,
             'beta2': beta2,
             'weight_decay': weight_decay,
+            'foreach': foreach,
             'weight_decouple': weight_decouple,
             'eps': eps,
             **kwargs,
@@ -86,11 +91,12 @@ class BCOS(BaseOptimizer):
 
             if self.mode in ('m', 'c') and 'm' not in state:
                 state['m'] = grad.clone()
+                self.maximize_gradient(state['m'], maximize=self.maximize)
 
             if self.mode in ('g', 'm') and 'v' not in state:
                 state['v'] = grad.square()
 
-    def compute_v(self, grad: torch.Tensor, m: torch.Tensor, beta: float, beta2: Optional[float]) -> torch.Tensor:
+    def compute_v(self, grad: torch.Tensor, m: torch.Tensor, beta: float, beta2: float | None) -> torch.Tensor:
         g2 = grad.square()
 
         if self.simple_cond:
@@ -102,6 +108,49 @@ class BCOS(BaseOptimizer):
             + (1.0 - beta) ** 2 * g2
             + 2.0 * beta * (1.0 - beta) ** 2 * m * grad
         )  # fmt: skip
+
+    def _step_foreach(
+        self,
+        group: ParamGroup,
+        params: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        state: dict[str, list[torch.Tensor]],
+    ) -> None:
+        beta, beta2 = group['beta'], group['beta2']
+
+        if self.maximize:
+            torch._foreach_neg_(grads)
+
+        self.apply_weight_decay_foreach(
+            params, grads, group['lr'], group['weight_decay'], group['weight_decouple'], False
+        )
+
+        directions = grads
+        if self.mode in ('m', 'c'):
+            directions = state['m']
+            torch._foreach_lerp_(directions, grads, weight=1.0 - beta)
+
+        if self.mode in ('g', 'm'):
+            vs = state['v']
+            beta_v = beta if beta2 is None else beta2
+            torch._foreach_lerp_(vs, torch._foreach_pow(directions, 2), weight=1.0 - beta_v)
+        else:
+            grad_sqs = torch._foreach_pow(grads, 2)
+            moment_sqs = torch._foreach_pow(directions, 2)
+            if self.simple_cond:
+                beta_v = 1.0 - (1.0 - beta) ** 2 if beta2 is None else beta2
+                vs = torch._foreach_mul(moment_sqs, beta_v)
+                torch._foreach_add_(vs, torch._foreach_mul(grad_sqs, 1.0 - beta_v))
+            else:
+                vs = torch._foreach_mul(moment_sqs, 3.0 * beta ** 2 - 2.0 * beta ** 3)
+                torch._foreach_add_(vs, torch._foreach_mul(grad_sqs, (1.0 - beta) ** 2))
+                cross_terms = torch._foreach_mul(directions, 2.0 * beta * (1.0 - beta) ** 2)
+                torch._foreach_mul_(cross_terms, grads)
+                torch._foreach_add_(vs, cross_terms)
+
+        de_noms = torch._foreach_sqrt(vs)
+        torch._foreach_add_(de_noms, group['eps'])
+        foreach_addcdiv_(params, directions, de_noms, value=-group['lr'])
 
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
@@ -115,6 +164,13 @@ class BCOS(BaseOptimizer):
             group['step'] += 1
 
             beta, beta2 = group['beta'], group['beta2']
+
+            if self.can_use_foreach(group, group.get('foreach', self.foreach)):
+                state_keys = (['m'] if self.mode in ('m', 'c') else []) + (['v'] if self.mode in ('g', 'm') else [])
+                params, grads, state = self.collect_trainable_params(group, self.state, state_keys=state_keys)
+                for batch in group_tensors_by_device_and_dtype(params, grads, state):
+                    self._step_foreach(group, batch['params'], batch['grads'], batch)
+                continue
 
             for p in group['params']:
                 if p.grad is None:
@@ -135,11 +191,11 @@ class BCOS(BaseOptimizer):
                     fixed_decay=False,
                 )
 
-                old_m: Optional[torch.Tensor] = state.get('m', None)
+                old_m: torch.Tensor | None = state.get('m', None)
 
                 if self.mode in ('m', 'c'):
                     m = state['m']
-                    m.mul_(beta).add_(grad, alpha=1.0 - beta)
+                    m.lerp_(grad, weight=1.0 - beta)
                     d = m
                 else:
                     d = grad
@@ -148,7 +204,7 @@ class BCOS(BaseOptimizer):
                     beta_v: float = beta if beta2 is None else beta2
 
                     v = state['v']
-                    v.mul_(beta_v).add_(d.square(), alpha=1.0 - beta_v)
+                    v.lerp_(d.square(), weight=1.0 - beta_v)
                 else:
                     v: torch.Tensor = self.compute_v(grad, old_m, beta, beta2)
 

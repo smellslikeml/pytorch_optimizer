@@ -1,5 +1,5 @@
-from collections import defaultdict
-from typing import Callable, Dict, List
+from collections import OrderedDict, defaultdict
+from collections.abc import Callable
 
 import torch
 from torch.optim import Optimizer
@@ -16,29 +16,50 @@ from pytorch_optimizer.base.type import (
     ParamsT,
     State,
 )
+from pytorch_optimizer.optimizer.utils.foreach import foreach_add_, foreach_lerp_, group_tensors_by_device_and_dtype
+
+
+def _apply_schedule_free_update(
+    params: list[torch.Tensor],
+    grads: list[torch.Tensor],
+    zs: list[torch.Tensor],
+    lr: float | torch.Tensor,
+    checkpoint: float | torch.Tensor,
+    momentum: float,
+    weight_decay: float,
+) -> None:
+    BaseOptimizer.apply_weight_decay_foreach(params, grads, lr, weight_decay, False, False)
+    foreach_lerp_(params, zs, weight=checkpoint)
+    foreach_add_(params, grads, alpha=lr * (momentum * (1.0 - checkpoint) - 1.0))
+    foreach_add_(zs, grads, alpha=-lr)
 
 
 class ScheduleFreeSGD(BaseOptimizer):
-    """Schedule-Free SGD.
+    """Schedule free SGD with weighted parameter averaging.
+
+    Call `train()` before training and `eval()` before evaluating averaged weights.
 
     Args:
-        params (ParamsT): iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): learning rate.
-        momentum (float): momentum factor, must be between 0 and 1 exclusive.
-        weight_decay (float): weight decay (L2 penalty).
-        r (float): use polynomial weighting in the average with power r.
-        weight_lr_power (float): during warmup, weights in the average equal to lr raised to this power;
-            0 disables weighting.
-        warmup_steps (int): enables a linear learning rate warmup.
-        eps (float): term added to denominator to improve numerical stability.
-        maximize (bool): maximize the objective instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        momentum: Interpolation coefficient for the training iterate, strictly between 0 and 1.
+        weight_decay: Weight decay coefficient.
+        r: Exponent of the polynomial step weighting in parameter averaging.
+        weight_lr_power: Exponent of the maximum learning rate seen so far in parameter averaging. `0` disables
+            rate weighting.
+        warmup_steps: Number of linear learning rate warmup steps.
+        eps: Term added to denominator to improve numerical stability.
+        maximize: Maximize the objective instead of minimizing it.
+        foreach: Use batched tensor operations. `None` enables them for supported parameter groups.
 
     """
+
+    _supports_compiled_foreach = True
 
     def __init__(
         self,
         params: ParamsT,
-        lr: float = 1.0,
+        lr: float | torch.Tensor = 1.0,
         momentum: float = 0.9,
         weight_decay: float = 0.0,
         r: float = 0.0,
@@ -46,17 +67,20 @@ class ScheduleFreeSGD(BaseOptimizer):
         warmup_steps: int = 0,
         eps: float = 1e-8,
         maximize: bool = False,
+        foreach: bool | None = None,
         **kwargs,
     ):
         self.validate_learning_rate(lr)
-        self.validate_range(momentum, 'momentum', 0.0, 1.0, range_type='[]')
+        self.validate_range(momentum, 'momentum', 0.0, 1.0, range_type='()')
         self.validate_non_negative(weight_decay, 'weight_decay')
         self.validate_non_negative(eps, 'eps')
 
         self.maximize = maximize
+        self.foreach = foreach
 
         defaults: Defaults = {
             'lr': lr,
+            'foreach': foreach,
             'momentum': momentum,
             'weight_decay': weight_decay,
             'r': r,
@@ -70,12 +94,13 @@ class ScheduleFreeSGD(BaseOptimizer):
 
         super().__init__(params, defaults)
 
-        self.base_lrs: List[float] = [group['lr'] for group in self.param_groups]
+        self.base_lrs: list[float] = [group['lr'] for group in self.param_groups]
 
     def __str__(self) -> str:
         return 'ScheduleFreeSGD'
 
     def eval(self):
+        """Switch to averaged weights for evaluation."""
         for group in self.param_groups:
             momentum = group['momentum']
             if group['train_mode']:
@@ -86,6 +111,7 @@ class ScheduleFreeSGD(BaseOptimizer):
                 group['train_mode'] = False
 
     def train(self):
+        """Switch to training weights before forward and backward passes."""
         for group in self.param_groups:
             momentum = group['momentum']
             if not group['train_mode']:
@@ -112,6 +138,19 @@ class ScheduleFreeSGD(BaseOptimizer):
             if len(state) == 0:
                 state['z'] = p.clone()
 
+    def _step_foreach(
+        self,
+        group: ParamGroup,
+        params: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        zs: list[torch.Tensor],
+        lr: float | torch.Tensor,
+        checkpoint: float | torch.Tensor,
+    ) -> None:
+        if self.maximize:
+            torch._foreach_neg_(grads)
+        _apply_schedule_free_update(params, grads, zs, lr, checkpoint, group['momentum'], group['weight_decay'])
+
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
         loss: Loss = None
@@ -135,6 +174,15 @@ class ScheduleFreeSGD(BaseOptimizer):
             weight_sum = group['weight_sum'] = group['weight_sum'] + weight
 
             checkpoint: float = weight / weight_sum if weight_sum != 0.0 else 0.0
+
+            if self.can_use_foreach(group, group.get('foreach', self.foreach)):
+                params, grads, state = self.collect_trainable_params(group, self.state, state_keys=['z'])
+                for batch in group_tensors_by_device_and_dtype(params, grads, state):
+                    self._step_foreach(
+                        group, batch['params'], batch['grads'], batch['z'],
+                        lr, checkpoint,
+                    )
+                continue
 
             for p in group['params']:
                 if p.grad is None:
@@ -168,28 +216,33 @@ class ScheduleFreeSGD(BaseOptimizer):
 
 
 class ScheduleFreeAdamW(BaseOptimizer):
-    """Schedule-Free AdamW.
+    """Schedule free AdamW with weighted parameter averaging.
+
+    Call `train()` before training and `eval()` before evaluating averaged weights.
 
     Args:
-        params (ParamsT): iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): learning rate.
-        betas (Betas): coefficients used for computing running averages of gradient and the squared hessian trace.
-        weight_decay (float): weight decay (L2 penalty).
-        r (float): use polynomial weighting in the average with power r.
-        weight_lr_power (float): during warmup, weights in the average equal to lr raised to this power;
-            0 disables weighting.
-        warmup_steps (int): enables a linear learning rate warmup.
-        decoupling_c (int): proposed coefficient in Refined Schedule-Free AdamW optimizer; default around 200.
-        ams_bound (bool): whether to use the AMSBound variant.
-        eps (float): term added to denominator for numerical stability.
-        maximize (bool): maximize the objective instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        betas: Interpolation coefficient for the training iterate and decay rate for squared gradients.
+        weight_decay: Weight decay coefficient.
+        r: Exponent of the polynomial step weighting in parameter averaging.
+        weight_lr_power: Exponent of the maximum learning rate seen so far in parameter averaging. `0` disables
+            rate weighting.
+        warmup_steps: Number of linear learning rate warmup steps.
+        decoupling_c: Coefficient scaling the parameter averaging weight. `0` uses standard averaging.
+        ams_bound: Use the running maximum of the second moment to bound adaptive updates.
+        eps: Term added to denominator for numerical stability.
+        maximize: Maximize the objective instead of minimizing it.
+        foreach: Use batched tensor operations. `None` enables them for supported parameter groups.
 
     """
+
+    _supports_compiled_foreach = True
 
     def __init__(
         self,
         params: ParamsT,
-        lr: float = 2.5e-3,
+        lr: float | torch.Tensor = 2.5e-3,
         betas: Betas = (0.9, 0.999),
         weight_decay: float = 0.0,
         r: float = 0.0,
@@ -199,18 +252,22 @@ class ScheduleFreeAdamW(BaseOptimizer):
         ams_bound: bool = False,
         eps: float = 1e-8,
         maximize: bool = False,
+        foreach: bool | None = None,
         **kwargs,
     ):
         self.validate_learning_rate(lr)
         self.validate_betas(betas)
+        self.validate_range(betas[0], 'beta1', 0.0, 1.0, range_type='()')
         self.validate_non_negative(decoupling_c, 'decoupling_c')
         self.validate_non_negative(weight_decay, 'weight_decay')
         self.validate_non_negative(eps, 'eps')
 
         self.maximize = maximize
+        self.foreach = foreach
 
         defaults: Defaults = {
             'lr': lr,
+            'foreach': foreach,
             'betas': betas,
             'weight_decay': weight_decay,
             'r': r,
@@ -227,12 +284,13 @@ class ScheduleFreeAdamW(BaseOptimizer):
 
         super().__init__(params, defaults)
 
-        self.base_lrs: List[float] = [group['lr'] for group in self.param_groups]
+        self.base_lrs: list[float] = [group['lr'] for group in self.param_groups]
 
     def __str__(self) -> str:
         return 'ScheduleFreeAdamW'
 
     def eval(self):
+        """Switch to averaged weights for evaluation."""
         for group in self.param_groups:
             beta1, _ = group['betas']
             if group['train_mode']:
@@ -243,6 +301,7 @@ class ScheduleFreeAdamW(BaseOptimizer):
                 group['train_mode'] = False
 
     def train(self):
+        """Switch to training weights before forward and backward passes."""
         for group in self.param_groups:
             beta1, _ = group['betas']
             if not group['train_mode']:
@@ -269,6 +328,32 @@ class ScheduleFreeAdamW(BaseOptimizer):
             if len(state) == 0:
                 state['z'] = p.clone()
                 state['exp_avg_sq'] = torch.zeros_like(p)
+                if group['ams_bound']:
+                    state['max_exp_avg_sq'] = torch.zeros_like(p)
+
+    def _step_foreach(
+        self,
+        group: ParamGroup,
+        params: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        state: dict[str, list[torch.Tensor]],
+        lr: float | torch.Tensor,
+        checkpoint: float | torch.Tensor,
+        bias_correction2: float | torch.Tensor,
+    ) -> None:
+        beta2 = group['betas'][1]
+        if self.maximize:
+            torch._foreach_neg_(grads)
+        torch._foreach_mul_(state['exp_avg_sq'], beta2)
+        torch._foreach_addcmul_(state['exp_avg_sq'], grads, grads, value=1.0 - beta2)
+        corrected = torch._foreach_div(state['exp_avg_sq'], bias_correction2)
+        de_noms = self.apply_ams_bound_foreach(
+            group['ams_bound'], corrected, state.get('max_exp_avg_sq', []), group['eps']
+        )
+        torch._foreach_div_(grads, de_noms)
+        _apply_schedule_free_update(
+            params, grads, state['z'], lr, checkpoint, group['betas'][0], group['weight_decay']
+        )
 
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
@@ -298,6 +383,16 @@ class ScheduleFreeAdamW(BaseOptimizer):
 
             if group['decoupling_c'] > 0:
                 checkpoint = min(1.0, checkpoint * (1.0 - beta1) * group['decoupling_c'])
+
+            if self.can_use_foreach(group, group.get('foreach', self.foreach)):
+                keys = ['z', 'exp_avg_sq'] + (['max_exp_avg_sq'] if group['ams_bound'] else [])
+                params, grads, state = self.collect_trainable_params(group, self.state, state_keys=keys)
+                for batch in group_tensors_by_device_and_dtype(params, grads, state):
+                    self._step_foreach(
+                        group, batch['params'], batch['grads'], batch,
+                        lr, checkpoint, bias_correction2,
+                    )
+                continue
 
             for p in group['params']:
                 if p.grad is None:
@@ -342,27 +437,32 @@ class ScheduleFreeAdamW(BaseOptimizer):
 
 
 class ScheduleFreeRAdam(BaseOptimizer):
-    """Schedule-Free RAdam.
+    """Schedule free RAdam with weighted parameter averaging.
+
+    Call `train()` before training and `eval()` before evaluating averaged weights.
 
     Args:
-        params (ParamsT): iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): learning rate.
-        betas (Betas): coefficients used for computing running averages of gradient and the squared hessian trace.
-        weight_decay (float): weight decay (L2 penalty).
-        r (float): use polynomial weighting in the average with power r.
-        weight_lr_power (float): during warmup, weights in the average equal to lr raised to this power;
-            0 disables weighting.
-        silent_sgd_phase (bool): if True, disables updates in the early SGD phase, only updates momentum to
-            stabilize training.
-        eps (float): term added to denominator to improve numerical stability.
-        maximize (bool): maximize the objective instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        betas: Interpolation coefficient for the training iterate and decay rate for squared gradients.
+        weight_decay: Weight decay coefficient.
+        r: Exponent of the polynomial step weighting in parameter averaging.
+        weight_lr_power: Exponent of the maximum learning rate seen so far in parameter averaging. `0` disables
+            rate weighting.
+        silent_sgd_phase: If True, disables updates in the early SGD phase, only updates momentum to stabilize
+            training.
+        eps: Term added to denominator to improve numerical stability.
+        maximize: Maximize the objective instead of minimizing it.
+        foreach: Use batched tensor operations. `None` enables them for supported parameter groups.
 
     """
+
+    _supports_compiled_foreach = True
 
     def __init__(
         self,
         params: ParamsT,
-        lr: float = 2.5e-3,
+        lr: float | torch.Tensor = 2.5e-3,
         betas: Betas = (0.9, 0.999),
         weight_decay: float = 0.0,
         r: float = 0.0,
@@ -370,17 +470,21 @@ class ScheduleFreeRAdam(BaseOptimizer):
         silent_sgd_phase: bool = True,
         eps: float = 1e-8,
         maximize: bool = False,
+        foreach: bool | None = None,
         **kwargs,
     ):
         self.validate_learning_rate(lr)
         self.validate_betas(betas)
+        self.validate_range(betas[0], 'beta1', 0.0, 1.0, range_type='()')
         self.validate_non_negative(weight_decay, 'weight_decay')
         self.validate_non_negative(eps, 'eps')
 
         self.maximize = maximize
+        self.foreach = foreach
 
         defaults: Defaults = {
             'lr': lr,
+            'foreach': foreach,
             'betas': betas,
             'weight_decay': weight_decay,
             'silent_sgd_phase': silent_sgd_phase,
@@ -399,6 +503,7 @@ class ScheduleFreeRAdam(BaseOptimizer):
         return 'ScheduleFreeRAdam'
 
     def eval(self):
+        """Switch to averaged weights for evaluation."""
         for group in self.param_groups:
             beta1, _ = group['betas']
             if group['train_mode']:
@@ -409,6 +514,7 @@ class ScheduleFreeRAdam(BaseOptimizer):
                 group['train_mode'] = False
 
     def train(self):
+        """Switch to training weights before forward and backward passes."""
         for group in self.param_groups:
             beta1, _ = group['betas']
             if not group['train_mode']:
@@ -436,6 +542,31 @@ class ScheduleFreeRAdam(BaseOptimizer):
                 state['z'] = p.clone()
                 state['exp_avg_sq'] = torch.zeros_like(p)
 
+    def _step_foreach(
+        self,
+        group: ParamGroup,
+        params: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        state: dict[str, list[torch.Tensor]],
+        lr: float | torch.Tensor,
+        checkpoint: float | torch.Tensor,
+        bias_correction2_sq: float | torch.Tensor,
+        rectified: bool,
+    ) -> None:
+        beta2 = group['betas'][1]
+        if self.maximize:
+            torch._foreach_neg_(grads)
+        torch._foreach_mul_(state['exp_avg_sq'], beta2)
+        torch._foreach_addcmul_(state['exp_avg_sq'], grads, grads, value=1.0 - beta2)
+        if rectified:
+            de_noms = torch._foreach_sqrt(state['exp_avg_sq'])
+            torch._foreach_div_(de_noms, bias_correction2_sq)
+            torch._foreach_add_(de_noms, group['eps'])
+            torch._foreach_div_(grads, de_noms)
+        _apply_schedule_free_update(
+            params, grads, state['z'], lr, checkpoint, group['betas'][0], group['weight_decay']
+        )
+
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
         loss: Loss = None
@@ -450,6 +581,7 @@ class ScheduleFreeRAdam(BaseOptimizer):
             beta1, beta2 = group['betas']
 
             bias_correction2: float = self.debias(beta2, group['step'])
+            bias_correction2_sq: float = bias_correction2 ** 0.5
 
             lr, n_sma = self.get_rectify_step_size(
                 is_rectify=True,
@@ -461,6 +593,8 @@ class ScheduleFreeRAdam(BaseOptimizer):
             )
             if lr < 0.0:
                 lr = float(not group['silent_sgd_phase'])
+            elif n_sma > 4.0:
+                lr = lr / bias_correction2_sq
 
             lr_max = group['lr_max'] = max(lr, group['lr_max'])
 
@@ -470,6 +604,15 @@ class ScheduleFreeRAdam(BaseOptimizer):
             checkpoint: float = weight / weight_sum if weight_sum != 0.0 else 0.0
 
             adaptive_y_lr: float = lr * (beta1 * (1.0 - checkpoint) - 1.0)
+
+            if self.can_use_foreach(group, group.get('foreach', self.foreach)):
+                params, grads, state = self.collect_trainable_params(group, self.state, state_keys=['z', 'exp_avg_sq'])
+                for batch in group_tensors_by_device_and_dtype(params, grads, state):
+                    self._step_foreach(
+                        group, batch['params'], batch['grads'], batch,
+                        lr, checkpoint, bias_correction2_sq, n_sma > 4.0,
+                    )
+                continue
 
             for p in group['params']:
                 if p.grad is None:
@@ -488,7 +631,7 @@ class ScheduleFreeRAdam(BaseOptimizer):
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
 
                 if n_sma > 4.0:
-                    de_nom = exp_avg_sq.sqrt().div_(bias_correction2).add_(group['eps'])
+                    de_nom = exp_avg_sq.sqrt().div_(bias_correction2_sq).add_(group['eps'])
                     grad.div_(de_nom)
 
                 self.apply_weight_decay(
@@ -509,27 +652,21 @@ class ScheduleFreeRAdam(BaseOptimizer):
 
 
 class ScheduleFreeWrapper(BaseOptimizer):
-    r"""Schedule-Free Wrapper for any base optimizer.
+    """Wrap an optimizer with schedule free parameter averaging.
 
-    This version uses a memory-efficient swap operation but may be slower than the reference version. In most cases
-    the performance difference is negligible. For the best possible performance and memory-usage, Schedule-Free
-    needs to be directly integrated with the base optimizer.
-
-    When using this version, you can disable the base optimizer's momentum, as it's no longer necessary when using
-    our wrapper's momentum (although you can use both types of momentum if you want).
-
-    If you set weight decay on the base optimizer, it computes weight decay at $z$. We offer the option to compute
-    weight decay at $y$, via the `weight_decay_at_y` parameter, which seems to give better results in our
-    experiments. This approach to decay only works correctly if the base optimizer uses group['lr'] as the current
-    learning rate.
+    Call `train()` before training and `eval()` before evaluation or saving evaluation
+    weights. The wrapper supplies momentum, so you can disable the base optimizer's momentum.
+    Base optimizer weight decay acts on the fast iterate `z`. `weight_decay_at_y` applies
+    additional decay at the training iterate `y` using the group's current learning rate.
 
     Args:
-        optimizer (Optimizer): base optimizer instance or class to wrap.
-        momentum (float): momentum factor.
-        weight_decay (float): weight decay (L2 penalty).
-        r (float): use polynomial weighting in the average with power r.
-        weight_lr_power (float): during warmup, weights in average equal lr raised to this power; 0 disables weighting.
-        maximize (bool): maximize the objective instead of minimizing.
+        optimizer: Base optimizer instance or class to wrap.
+        momentum: Momentum factor.
+        weight_decay: Weight decay coefficient.
+        r: Exponent of the polynomial step weighting in parameter averaging.
+        weight_lr_power: Exponent of the maximum learning rate seen so far in parameter averaging. `0` disables
+            rate weighting.
+        maximize: Maximize the objective instead of minimizing it.
 
     """
 
@@ -543,7 +680,7 @@ class ScheduleFreeWrapper(BaseOptimizer):
         maximize: bool = False,
         **kwargs,
     ):
-        self.validate_range(momentum, 'momentum', 0.0, 1.0, '[)')
+        self.validate_range(momentum, 'momentum', 0.0, 1.0, '()')
         self.validate_non_negative(weight_decay, 'weight_decay')
 
         self.momentum = momentum
@@ -555,8 +692,9 @@ class ScheduleFreeWrapper(BaseOptimizer):
 
         self.optimizer: Optimizer = self.load_optimizer(optimizer, **kwargs)
 
-        self._optimizer_step_pre_hooks: Dict[int, Callable] = {}
-        self._optimizer_step_post_hooks: Dict[int, Callable] = {}
+        self._optimizer_step_pre_hooks: dict[int, Callable] = OrderedDict()
+        self._optimizer_step_post_hooks: dict[int, Callable] = OrderedDict()
+        self._patch_step_function()
 
         self.state: State = defaultdict(dict)
         self.defaults: Defaults = self.optimizer.defaults
@@ -575,18 +713,47 @@ class ScheduleFreeWrapper(BaseOptimizer):
         return self.optimizer.add_param_group(param_group)
 
     def state_dict(self) -> State:
-        return {'schedulefree_state': self.state, 'base_optimizer': self.optimizer.state_dict()}
+        schedulefree_state: State = {
+            (group_index, parameter_index): dict(self.state[p])
+            for group_index, group in enumerate(self.param_groups)
+            for parameter_index, p in enumerate(group['params'])
+            if p in self.state
+        }
+        return {
+            'schedulefree_state': schedulefree_state,
+            'base_optimizer': self.optimizer.state_dict(),
+            'train_mode': self.train_mode,
+        }
 
     def load_state_dict(self, state: State) -> None:
-        r"""Load state."""
-        self.state = state['schedulefree_state']
+        """Restore the base optimizer state from a checkpoint."""
+        saved_state = state['schedulefree_state']
+        restored_state: State = {}
+        for group_index, group in enumerate(self.param_groups):
+            for parameter_index, p in enumerate(group['params']):
+                key = (group_index, parameter_index)
+                if key in saved_state:
+                    restored_state[p] = dict(saved_state[key])
+                elif p in saved_state:
+                    restored_state[p] = dict(saved_state[p])
+
+        if len(restored_state) != len(saved_state):
+            raise ValueError('schedule-free state does not match the current parameters')
+
         self.optimizer.load_state_dict(state['base_optimizer'])
+        for p, parameter_state in restored_state.items():
+            for key, value in parameter_state.items():
+                if isinstance(value, torch.Tensor):
+                    parameter_state[key] = value.to(device=p.device, dtype=p.dtype)
+        self.state = defaultdict(dict, restored_state)
+        self.train_mode = state.get('train_mode', self.train_mode)
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         self.optimizer.zero_grad(set_to_none)
 
     @torch.no_grad()
     def eval(self):
+        """Switch to averaged weights for evaluation."""
         if not self.train_mode:
             return
 
@@ -600,6 +767,7 @@ class ScheduleFreeWrapper(BaseOptimizer):
 
     @torch.no_grad()
     def train(self):
+        """Switch to training weights before forward and backward passes."""
         if self.train_mode:
             return
 
@@ -630,9 +798,9 @@ class ScheduleFreeWrapper(BaseOptimizer):
 
     @staticmethod
     def swap(x: torch.Tensor, y: torch.Tensor) -> None:
-        x.view(torch.uint8).bitwise_xor_(y.view(torch.uint8))
-        y.view(torch.uint8).bitwise_xor_(x.view(torch.uint8))
-        x.view(torch.uint8).bitwise_xor_(y.view(torch.uint8))
+        saved = x.clone()
+        x.copy_(y)
+        y.copy_(saved)
 
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
@@ -689,7 +857,7 @@ class ScheduleFreeWrapper(BaseOptimizer):
             lr: float = group['lr'] * group.get('d', 1.0)
             lr_max = group['lr_max'] = max(lr, group.get('lr_max', 0))
 
-            weight: float = (group['step'] ** group['lr']) * (lr_max ** self.weight_lr_power)  # fmt: skip
+            weight: float = (group['step'] ** self.r) * (lr_max ** self.weight_lr_power)
             weight_sum = group['weight_sum'] = group.get('weight_sum', 0.0) + weight
 
             checkpoint: float = weight / weight_sum if weight_sum != 0.0 else 0.0

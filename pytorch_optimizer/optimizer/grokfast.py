@@ -1,6 +1,6 @@
 import math
 from collections import deque
-from typing import Dict, List, Literal, Optional, cast
+from typing import Literal
 
 import torch
 from torch import nn
@@ -8,6 +8,7 @@ from torch import nn
 from pytorch_optimizer.base.exception import NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Betas, Closure, Defaults, Loss, ParamGroup, ParamsT
+from pytorch_optimizer.optimizer.utils.foreach import foreach_addcdiv_, group_tensors_by_device_and_dtype
 
 FILTER_TYPE = Literal['mean', 'sum']
 
@@ -15,48 +16,51 @@ FILTER_TYPE = Literal['mean', 'sum']
 @torch.no_grad()
 def gradfilter_ma(
     model: nn.Module,
-    grads: Optional[Dict[str, deque]] = None,
+    grads: dict[str, deque] | None = None,
     window_size: int = 100,
     lamb: float = 5.0,
     filter_type: FILTER_TYPE = 'mean',
     warmup: bool = True,
-) -> Dict[str, deque]:
-    """Grokfast-MA.
+) -> dict[str, deque]:
+    """Amplify slow gradient components with a windowed moving average filter.
 
     Args:
-        model (nn.Module): Model that contains every trainable parameters.
-        grads (Optional[Dict[str, deque]]): Running memory (queue for windowed moving average).
-            Initialize by setting  it to None.
-            Feed the output of the method recursively after one call.
-        window_size (int): The width of the filter window.
-            Additional memory requirements increase linearly with window size.
-        lamb (float): Amplifying factor hyperparameter of the filter.
-        filter_type (FILTER_TYPE): Aggregation method for the running queue.
-        warmup (bool): If true, the filter is not applied until the queue is filled.
+        model: Model whose gradients to modify in place after backward.
+        grads: Per parameter gradient queues from the previous call. `None` creates the queues.
+        window_size: Number of gradients to retain per parameter.
+        lamb: Amplification factor for the filtered gradients.
+        filter_type: Queue reduction: `'mean'` or `'sum'`.
+        warmup: Wait until each queue is full before applying the filter.
 
-    Example:
-        loss.backwards()  # Calculate the gradients.
+    Returns:
+        dict[str, deque]: Gradient queues to pass into the next call.
 
-        grads = gradfilter_ma(model, grads=grads, window_size=window_size, lamb=lamb)
-
-        optimizer.step()  # Call the optimizer.
+    Examples:
+        ```python
+        grads = None
+        for inputs, targets in data:
+            optimizer.zero_grad()
+            loss_fn(model(inputs), targets).backward()
+            grads = gradfilter_ma(model, grads=grads)
+            optimizer.step()
+        ```
 
     """
+    if filter_type not in ('mean', 'sum'):
+        raise NotImplementedError(f'not supported filter_type {filter_type}')
+
     if grads is None:
         grads = {n: deque(maxlen=window_size) for n, p in model.named_parameters() if p.requires_grad}
 
     for n, p in model.named_parameters():
-        if p.requires_grad:
-            grads[n].append(p.grad)
+        if p.requires_grad and p.grad is not None:
+            grads.setdefault(n, deque(maxlen=window_size)).append(p.grad.clone())
 
             if not warmup or len(grads[n]) == window_size:
                 if filter_type == 'mean':
                     avg = sum(grads[n]) / len(grads[n])
                 elif filter_type == 'sum':
                     avg = sum(grads[n])
-                else:
-                    raise NotImplementedError(f'not supported filter_type {filter_type}')
-
                 p.grad.add_(avg, alpha=lamb)
 
     return grads
@@ -65,65 +69,73 @@ def gradfilter_ma(
 @torch.no_grad()
 def gradfilter_ema(
     model: nn.Module,
-    grads: Optional[Dict[str, torch.Tensor]] = None,
+    grads: dict[str, torch.Tensor] | None = None,
     alpha: float = 0.98,
     lamb: float = 2.0,
-) -> Dict[str, torch.Tensor]:
-    """Grokfast.
+) -> dict[str, torch.Tensor]:
+    """Amplify slow gradient components with an exponential moving average filter.
 
     Args:
-        model (nn.Module): Model that contains every trainable parameters.
-        grads (Optional[Dict[str, deque]]): Running memory (EMA). Initialize by setting it to None.
-            Feed the output of the method recursively after one call.
-        alpha (int): Momentum hyperparameter of the EMA.
-        lamb (float): Amplifying factor hyperparameter of the filter.
+        model: Model whose gradients to modify in place after backward.
+        grads: Per parameter gradient averages from the previous call. `None` initializes them.
+        alpha: Decay rate for the gradient moving average.
+        lamb: Amplification factor for the averaged gradients.
 
-    Example:
-        loss.backwards()  # Calculate the gradients.
+    Returns:
+        dict[str, torch.Tensor]: Gradient averages to pass into the next call.
 
-        grads = gradfilter_ema(model, grads=grads, alpha=alpha, lamb=lamb)
-
-        optimizer.step()  # Call the optimizer.
+    Examples:
+        ```python
+        grads = None
+        for inputs, targets in data:
+            optimizer.zero_grad()
+            loss_fn(model(inputs), targets).backward()
+            grads = gradfilter_ema(model, grads=grads)
+            optimizer.step()
+        ```
 
     """
     if grads is None:
-        grads = {n: p.grad for n, p in model.named_parameters() if p.requires_grad and p.grad is not None}
-
-    grads = cast(Dict[str, torch.Tensor], grads)
+        grads = {}
 
     for n, p in model.named_parameters():
         if p.requires_grad and p.grad is not None:
-            grads[n].mul_(alpha).add_(p.grad, alpha=1.0 - alpha)
+            if n not in grads:
+                grads[n] = p.grad.clone()
+            else:
+                grads[n].lerp_(p.grad, weight=1.0 - alpha)
             p.grad.add_(grads[n], alpha=lamb)
 
     return grads
 
 
 class GrokFastAdamW(BaseOptimizer):
-    """Accelerated Grokking by Amplifying Slow Gradients with AdamW.
+    """AdamW with amplification of slow gradient components.
 
     Args:
-        params (ParamsT): Iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): Learning rate.
-        betas (Betas): Coefficients used for computing running averages of gradient and the squared Hessian trace.
-        grokfast (bool): Whether to use grokfast.
-        grokfast_alpha (float): Momentum hyperparameter of the EMA.
-        grokfast_lamb (float): Amplifying factor hyperparameter of the filter.
-        grokfast_after_step (int): Warmup step for grokfast.
-        weight_decay (float): Weight decay (L2 penalty).
-        weight_decouple (bool): The optimizer uses decoupled weight decay as in AdamW.
-        fixed_decay (bool): Fix weight decay.
-        eps (float): Term added to the denominator to improve numerical stability.
-        foreach (Optional[bool]): Whether to use foreach (multi-tensor) operations for speed.
-            None means auto-detect based on device (True for CUDA, False otherwise).
-        maximize (bool): Maximize the objective with respect to the params, instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        betas: Decay rates for the first and second moments.
+        grokfast: Whether to use grokfast.
+        grokfast_alpha: Momentum hyperparameter of the EMA.
+        grokfast_lamb: Amplifying factor hyperparameter of the filter.
+        grokfast_after_step: Warmup step for grokfast.
+        weight_decay: Weight decay coefficient.
+        weight_decouple: Apply weight decay to parameters instead of adding it to the gradient.
+        fixed_decay: Apply decoupled weight decay without scaling it by the learning rate.
+        normalize_lr: Divide the learning rate by `1 + grokfast_lamb` when Grokfast is enabled.
+        eps: Term added to the denominator to improve numerical stability.
+        foreach: Use batched tensor operations. `None` enables them for supported parameter groups.
+        maximize: Maximize the objective instead of minimizing it.
 
     """
+
+    _supports_compiled_foreach = True
 
     def __init__(
         self,
         params: ParamsT,
-        lr: float = 1e-4,
+        lr: float | torch.Tensor = 1e-4,
         betas: Betas = (0.9, 0.99),
         grokfast: bool = True,
         grokfast_alpha: float = 0.98,
@@ -134,7 +146,7 @@ class GrokFastAdamW(BaseOptimizer):
         fixed_decay: bool = False,
         normalize_lr: bool = True,
         eps: float = 1e-8,
-        foreach: Optional[bool] = None,
+        foreach: bool | None = None,
         maximize: bool = False,
         **kwargs,
     ):
@@ -148,7 +160,7 @@ class GrokFastAdamW(BaseOptimizer):
         self.maximize = maximize
 
         if grokfast and normalize_lr:
-            lr /= 1.0 + grokfast_lamb
+            lr = lr / (1.0 + grokfast_lamb)
 
         defaults: Defaults = {
             'lr': lr,
@@ -186,7 +198,9 @@ class GrokFastAdamW(BaseOptimizer):
                 state['exp_avg'] = torch.zeros_like(p)
                 state['exp_avg_sq'] = torch.zeros_like(p)
                 if group['grokfast'] and group['grokfast_lamb'] > 0.0:
-                    state['grok_exp_avg'] = grad.clone()
+                    grok_exp_avg = grad.clone()
+                    self.maximize_gradient(grok_exp_avg, maximize=self.maximize)
+                    state['grok_exp_avg'] = grok_exp_avg
 
     def _can_use_foreach(self, group: ParamGroup) -> bool:
         if group.get('foreach') is False:
@@ -197,17 +211,16 @@ class GrokFastAdamW(BaseOptimizer):
     def _step_foreach(
         self,
         group: ParamGroup,
-        params: List[torch.Tensor],
-        grads: List[torch.Tensor],
-        exp_avgs: List[torch.Tensor],
-        exp_avg_sqs: List[torch.Tensor],
-        grok_exp_avgs: List[torch.Tensor],
+        params: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        exp_avgs: list[torch.Tensor],
+        exp_avg_sqs: list[torch.Tensor],
+        grok_exp_avgs: list[torch.Tensor],
         should_grokfast: bool,
+        bias_correction1: float | torch.Tensor,
+        bias_correction2_sq: float | torch.Tensor,
     ) -> None:
         beta1, beta2 = group['betas']
-
-        bias_correction1: float = self.debias(beta1, group['step'])
-        bias_correction2_sq: float = math.sqrt(self.debias(beta2, group['step']))
 
         if self.maximize:
             torch._foreach_neg_(grads)
@@ -222,8 +235,9 @@ class GrokFastAdamW(BaseOptimizer):
         )
 
         if should_grokfast:
-            torch._foreach_lerp_(grok_exp_avgs, grads, weight=1.0 - group['grokfast_alpha'])
-            torch._foreach_add_(grads, grok_exp_avgs, alpha=group['grokfast_lamb'])
+            for average, grad in zip(grok_exp_avgs, grads):
+                average.lerp_(grad, weight=1.0 - group['grokfast_alpha'])
+                grad.add_(average, alpha=group['grokfast_lamb'])
 
         torch._foreach_lerp_(exp_avgs, grads, weight=1.0 - beta1)
         torch._foreach_mul_(exp_avg_sqs, beta2)
@@ -233,10 +247,7 @@ class GrokFastAdamW(BaseOptimizer):
         torch._foreach_div_(de_noms, bias_correction2_sq)
         torch._foreach_clamp_min_(de_noms, group['eps'])
 
-        updates = torch._foreach_div(exp_avgs, bias_correction1)
-        torch._foreach_div_(updates, de_noms)
-
-        torch._foreach_add_(params, updates, alpha=-group['lr'])
+        foreach_addcdiv_(params, exp_avgs, de_noms, value=-group['lr'] / bias_correction1)
 
     def _step_per_param(self, group: ParamGroup, should_grokfast: bool) -> None:
         beta1, beta2 = group['betas']
@@ -275,14 +286,12 @@ class GrokFastAdamW(BaseOptimizer):
                 grok_exp_avg.lerp_(grad, weight=1.0 - group['grokfast_alpha'])
                 grad.add_(grok_exp_avg, alpha=group['grokfast_lamb'])
 
-            exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+            exp_avg.lerp_(grad, weight=1.0 - beta1)
             exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
 
             de_nom = exp_avg_sq.sqrt().div_(bias_correction2_sq).clamp_(min=group['eps'])
 
-            update = exp_avg.div(bias_correction1).div_(de_nom)
-
-            p.add_(update, alpha=-group['lr'])
+            p.addcdiv_(exp_avg, de_nom, value=-group['lr'] / bias_correction1)
 
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
@@ -305,15 +314,18 @@ class GrokFastAdamW(BaseOptimizer):
                     self.state,
                     state_keys=['exp_avg', 'exp_avg_sq', 'grok_exp_avg'],
                 )
-                if params:
+                beta1, beta2 = group['betas']
+                for batch in group_tensors_by_device_and_dtype(params, grads, state_dict):
                     self._step_foreach(
                         group,
-                        params,
-                        grads,
-                        state_dict['exp_avg'],
-                        state_dict['exp_avg_sq'],
-                        state_dict['grok_exp_avg'],
+                        batch['params'],
+                        batch['grads'],
+                        batch['exp_avg'],
+                        batch['exp_avg_sq'],
+                        batch['grok_exp_avg'],
                         should_grokfast,
+                        self.debias(beta1, group['step']),
+                        math.sqrt(self.debias(beta2, group['step'])),
                     )
             else:
                 self._step_per_param(group, should_grokfast)

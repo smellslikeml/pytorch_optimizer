@@ -1,15 +1,27 @@
-from typing import Tuple
-
 import numpy as np
 import pytest
 import torch
 
-from pytorch_optimizer.optimizer import AdamW
-from tests.utils import Example, simple_parameter
+from tests.fixtures import make_parameter
+from tests.utils import build_optimizer
 
 
 @pytest.fixture(scope='session')
-def environment(num_samples: int = 100, dims: int = 2, seed: int = 42) -> Tuple[torch.Tensor, torch.Tensor]:
+def device(pytestconfig) -> torch.device:
+    device_name = pytestconfig.getoption('--device')
+    if device_name == 'cuda' and not torch.cuda.is_available():
+        raise pytest.UsageError('CUDA training tests require a CUDA-enabled PyTorch installation and an available GPU')
+    return torch.device(device_name)
+
+
+def pytest_addoption(parser):
+    parser.addoption('--device', choices=('cpu', 'cuda'), default='cpu', help='Device for optimizer training tests')
+
+
+@pytest.fixture(scope='session')
+def environment(
+    device: torch.device, num_samples: int = 100, dims: int = 2, seed: int = 42
+) -> tuple[torch.Tensor, torch.Tensor]:
     torch.manual_seed(42)
     rng = np.random.RandomState(seed)
 
@@ -21,17 +33,17 @@ def environment(num_samples: int = 100, dims: int = 2, seed: int = 42) -> Tuple[
 
     y = np.array([0] * mid + [1] * mid).reshape(100, 1)
 
-    return torch.Tensor(x), torch.Tensor(y)
+    return torch.Tensor(x).to(device), torch.Tensor(y).to(device)
 
 
 @pytest.fixture
-def optimizer_factory():
-    return AdamW(Example().parameters())
+def scheduler_optimizer():
+    return build_optimizer('adamw', [make_parameter(grad=None)])
 
 
 @pytest.fixture
 def param_groups():
-    return [{'params': simple_parameter()}]
+    return [{'params': make_parameter()}]
 
 
 @pytest.fixture

@@ -1,5 +1,4 @@
 import math
-from typing import Optional, Set
 
 import torch
 from torch import distributed as dist
@@ -11,21 +10,22 @@ from pytorch_optimizer.base.type import Betas, Closure, Defaults, Loss, ParamGro
 
 
 class AdamMini(BaseOptimizer):  # pragma: no cover
-    """Use Fewer Learning Rates To Gain More.
+    """Adam with shared second moment estimates within parameter blocks.
 
     Args:
-        model (nn.Module): Model instance.
-        model_sharding (bool): Set to True if you are using model parallelism with more than 1 GPU, including FSDP
-            and zero_1, zero_2, zero_3 in DeepSpeed. Set to False otherwise.
-        lr (float): Learning rate.
-        betas (Betas): Coefficients used for computing running averages of gradient and the squared Hessian trace.
-        weight_decay (float): Weight decay (L2 penalty).
-        num_embeds (int): Number of embedding dimensions. Could be unspecified if training non-transformer models.
-        num_heads (int): Number of attention heads. Could be unspecified if training non-transformer models.
-        num_query_groups (Optional[int]): Number of query groups in Group Query Attention (GQA).
-            If not specified, defaults to num_heads. Could be unspecified for non-transformer models.
-        eps (float): Term added to the denominator to improve numerical stability.
-        maximize (bool): Maximize the objective with respect to the parameters, instead of minimizing.
+        model: Model instance.
+        model_sharding: Set to True if you are using model parallelism with more than 1 GPU, including FSDP and
+            zero_1, zero_2, zero_3 in DeepSpeed. Set to False otherwise.
+        lr: Learning rate.
+        betas: Decay rates for the first and second moments.
+        weight_decay: Weight decay coefficient.
+        num_embeds: Number of embedding dimensions. Could be unspecified if training non transformer models.
+        num_heads: Number of attention heads. Could be unspecified if training non transformer models.
+        num_query_groups: Number of query groups in Group Query Attention (GQA). If not specified, defaults to
+            num_heads. Could be unspecified for non transformer models.
+        eps: Term added to the denominator to improve numerical stability.
+        maximize: Maximize the objective instead of minimizing it.
+        foreach: Batch unsharded block updates. `None` enables batching on CUDA.
 
     """
 
@@ -38,20 +38,23 @@ class AdamMini(BaseOptimizer):  # pragma: no cover
         model_sharding: bool = False,
         num_embeds: int = 2048,
         num_heads: int = 32,
-        num_query_groups: Optional[int] = None,
+        num_query_groups: int | None = None,
         eps: float = 1e-8,
         maximize: bool = False,
+        foreach: bool | None = None,
         **kwargs,
     ):
         self.validate_learning_rate(lr)
         self.validate_betas(betas)
         self.validate_non_negative(weight_decay, 'weight_decay')
-        self.validate_non_negative(num_embeds, 'num_embeds')
-        self.validate_non_negative(num_heads, 'num_heads')
+        self.validate_positive(num_embeds, 'num_embeds')
+        self.validate_positive(num_heads, 'num_heads')
         self.validate_non_negative(eps, 'eps')
 
-        self.num_query_groups: int = num_query_groups if num_query_groups is not None else num_embeds
-        self.validate_mod(num_embeds, self.num_query_groups)
+        self.num_query_groups: int = num_query_groups if num_query_groups is not None else num_heads
+        self.validate_positive(self.num_query_groups, 'num_query_groups')
+        self.validate_mod(num_embeds, num_heads)
+        self.validate_mod(num_heads, self.num_query_groups)
 
         # Visible GPUs are not a process group. all_gather below requires
         # dist to be initialized; otherwise a single process that can see
@@ -65,9 +68,10 @@ class AdamMini(BaseOptimizer):  # pragma: no cover
         self.model_sharding = model_sharding
         self.num_embeds = num_embeds
         self.num_heads = num_heads
+        self.foreach = foreach
 
-        self.embed_blocks: Set[str] = {'embed', 'embd', 'wte', 'lm_head.weight', 'output.weight'}
-        self.qk_blocks: Set[str] = {'k_proj.weight', 'q_proj.weight', 'wq.weight', 'wk.weight'}
+        self.embed_blocks: set[str] = {'embed', 'embd', 'wte', 'lm_head.weight', 'output.weight'}
+        self.qk_blocks: set[str] = {'k_proj.weight', 'q_proj.weight', 'wq.weight', 'wk.weight'}
 
         self.maximize = maximize
 
@@ -79,6 +83,14 @@ class AdamMini(BaseOptimizer):  # pragma: no cover
 
     def __str__(self) -> str:
         return 'AdamMini'
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        super().load_state_dict(state_dict)
+        for group, saved_group in zip(self.param_groups, state_dict['param_groups']):
+            for p, key in zip(group['params'], saved_group['params']):
+                for name, value in state_dict['state'].get(key, {}).items():
+                    if isinstance(value, torch.Tensor) and value.is_floating_point():
+                        self.state[p][name] = value.to(device=p.device, dtype=torch.float32)
 
     def get_optimizer_groups(self, weight_decay: float):
         groups = []
@@ -94,10 +106,6 @@ class AdamMini(BaseOptimizer):  # pragma: no cover
 
             if any(block in name for block in self.qk_blocks):
                 group['parameter_per_head'] = self.num_embeds * self.num_embeds // self.num_heads
-
-            if 'attn.attn.weight' in name or 'attn.qkv.weight' in name:
-                group['n_head'] = self.num_heads
-                group['q_per_kv'] = self.num_embeds // self.num_query_groups
 
             groups.append(group)
 
@@ -128,9 +136,13 @@ class AdamMini(BaseOptimizer):  # pragma: no cover
         m.lerp_(grad, weight=1.0 - beta1)
         v.mul_(beta2).addcmul_(grad, grad.conj(), value=1.0 - beta2)
 
-        h = (v.sqrt() / bias_correction2_sq).add_(eps)
+        h = v.sqrt().div_(bias_correction2_sq).add_(eps)
 
-        p.addcdiv_(m, h, value=-lr / bias_correction1)
+        # PyTorch 2.1 CPU addcdiv does not support mixed precision inputs.
+        if p.device.type == 'cpu' and p.dtype != m.dtype:
+            p.add_(m / h, alpha=-lr / bias_correction1)
+        else:
+            p.addcdiv_(m, h, value=-lr / bias_correction1)
 
     @staticmethod
     def step_attn_proj(
@@ -158,11 +170,11 @@ class AdamMini(BaseOptimizer):  # pragma: no cover
         m.lerp_(grad, weight=1.0 - beta1)
 
         tmp_lr = torch.mean(grad * grad, dim=1).to(m.device)
-        v.mul_(beta2).add_(tmp_lr, alpha=1.0 - beta2)
+        v.lerp_(tmp_lr.to(dtype=v.dtype), weight=1.0 - beta2)
 
-        h = (v.sqrt() / bias_correction2_sq).add_(eps)
+        h = v.sqrt().div_(bias_correction2_sq).add_(eps)
 
-        update = (1 / (h * bias_correction1)).view(head, 1).mul_(m)
+        update = (1 / (h * bias_correction1)).view(head, 1).mul(m)
 
         if p.dim() > 1:
             d0, d1 = p.size()
@@ -177,7 +189,7 @@ class AdamMini(BaseOptimizer):  # pragma: no cover
         p,
         grad,
         state,
-        num_heads: int,
+        num_query_groups: int,
         q_per_kv: int,
         lr: float,
         beta1: float,
@@ -187,21 +199,21 @@ class AdamMini(BaseOptimizer):  # pragma: no cover
         eps: float,
     ) -> None:
         if len(state) == 0:
-            state['m'] = torch.zeros_like(p, dtype=torch.float32).view(num_heads, q_per_kv + 2, -1)
-            state['v_mean'] = torch.zeros(num_heads, q_per_kv + 2, device=state['m'].device)
+            state['m'] = torch.zeros_like(p, dtype=torch.float32).view(num_query_groups, q_per_kv + 2, -1)
+            state['v_mean'] = torch.zeros(num_query_groups, q_per_kv + 2, device=state['m'].device)
 
         m, v = state['m'], state['v_mean']
 
-        grad = grad.view(num_heads, q_per_kv + 2, -1)
+        grad = grad.view(num_query_groups, q_per_kv + 2, -1)
 
         m.lerp_(grad, weight=1.0 - beta1)
 
         tmp_lr = torch.mean(grad * grad, dim=2).to(m.device)
-        v.mul_(beta2).add_(tmp_lr, alpha=1.0 - beta2)
+        v.lerp_(tmp_lr.to(dtype=v.dtype), weight=1.0 - beta2)
 
-        h = (v.sqrt() / bias_correction2_sq).add_(eps)
+        h = v.sqrt().div_(bias_correction2_sq).add_(eps)
 
-        update = (1 / (h * bias_correction1)).view(num_heads, q_per_kv + 2, -1).mul_(m)
+        update = m / (h * bias_correction1).unsqueeze(-1)
 
         if p.dim() > 1:
             d0, d1 = p.size()
@@ -211,18 +223,7 @@ class AdamMini(BaseOptimizer):  # pragma: no cover
 
         p.add_(update, alpha=-lr)
 
-    def step_lefts(
-        self,
-        p,
-        grad,
-        state,
-        lr: float,
-        beta1: float,
-        beta2: float,
-        bias_correction1: float,
-        bias_correction2_sq: float,
-        eps: float,
-    ) -> None:
+    def init_lefts(self, p, state) -> None:
         if len(state) == 0:
             dim = torch.tensor(p.numel(), device=p.device, dtype=torch.float32)
 
@@ -245,6 +246,20 @@ class AdamMini(BaseOptimizer):  # pragma: no cover
             state['dimension'] = dim
             state['reduced'] = reduced
 
+    def step_lefts(
+        self,
+        p,
+        grad,
+        state,
+        lr: float,
+        beta1: float,
+        beta2: float,
+        bias_correction1: float,
+        bias_correction2_sq: float,
+        eps: float,
+    ) -> None:
+        self.init_lefts(p, state)
+
         tmp_lr = torch.sum(grad * grad)
 
         if state['reduced']:
@@ -255,9 +270,9 @@ class AdamMini(BaseOptimizer):  # pragma: no cover
         m, v = state['m'], state['v_mean']
 
         m.lerp_(grad, weight=1.0 - beta1)
-        v.mul_(beta2).add_(tmp_lr, alpha=1.0 - beta2)
+        v.lerp_(tmp_lr.to(dtype=v.dtype), weight=1.0 - beta2)
 
-        h = (v.sqrt() / bias_correction2_sq).add_(eps)
+        h = v.sqrt().div_(bias_correction2_sq).add_(eps)
 
         stepsize = (1 / bias_correction1) / h
 
@@ -265,12 +280,34 @@ class AdamMini(BaseOptimizer):  # pragma: no cover
 
         p.add_(update, alpha=-lr)
 
+    def step_lefts_foreach(self, group, params, grads) -> None:
+        beta1, beta2 = group['betas']
+
+        states = [self.state[p] for p in params]
+        moments = [state['m'] for state in states]
+
+        means = torch.stack([grad.square().sum() for grad in grads]) / torch.stack([
+            state['dimension'] for state in states
+        ])
+        variances = torch.stack([state['v_mean'] for state in states])
+        variances.lerp_(means, weight=1.0 - beta2)
+        torch._foreach_copy_([state['v_mean'] for state in states], variances.unbind())
+
+        torch._foreach_lerp_(moments, grads, weight=1.0 - beta1)
+
+        denominators = variances.sqrt_().div_(math.sqrt(self.debias(beta2, group['step']))).add_(group['eps'])
+        scales = denominators.reciprocal_().div_(self.debias(beta1, group['step']))
+        updates = torch._foreach_mul(moments, scales.unbind())
+        torch._foreach_add_(params, updates, alpha=-group['lr'])
+
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
         loss: Loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        batches = {}
 
         for group in self.param_groups:
             self.init_group(group)
@@ -332,8 +369,8 @@ class AdamMini(BaseOptimizer):  # pragma: no cover
                         p,
                         grad,
                         state,
-                        group['n_head'],
-                        group['q_per_kv'],
+                        self.num_query_groups,
+                        self.num_heads // self.num_query_groups,
                         group['lr'],
                         beta1,
                         beta2,
@@ -342,6 +379,16 @@ class AdamMini(BaseOptimizer):  # pragma: no cover
                         group['eps'],
                     )
                 else:
+                    if (self.foreach is True or (self.foreach is None and p.is_cuda)) and not (
+                        self.model_sharding and self.world_size > 1
+                    ):
+                        self.init_lefts(p, state)
+                        key = (group['lr'], group['betas'], group['eps'], group['step'], p.device, p.dtype)
+                        batch = batches.setdefault(key, (group, [], []))
+                        batch[1].append(p)
+                        batch[2].append(grad)
+                        continue
+
                     self.step_lefts(
                         p,
                         grad,
@@ -353,5 +400,8 @@ class AdamMini(BaseOptimizer):  # pragma: no cover
                         bias_correction2_sq,
                         group['eps'],
                     )
+
+        for group, params, grads in batches.values():
+            self.step_lefts_foreach(group, params, grads)
 
         return loss

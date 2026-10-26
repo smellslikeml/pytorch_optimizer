@@ -1,4 +1,3 @@
-from typing import List, Optional
 
 import torch
 
@@ -6,33 +5,35 @@ from pytorch_optimizer.base.exception import NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Betas, Closure, Defaults, Loss, ParamGroup, ParamsT
 from pytorch_optimizer.optimizer.gradient_centralization import centralize_gradient
+from pytorch_optimizer.optimizer.utils.foreach import foreach_add_, group_tensors_by_device_and_dtype
 
 
 class Lion(BaseOptimizer):
-    """Symbolic Discovery of Optimization Algorithms.
+    """Sign based updates from interpolated gradient momentum.
 
     Args:
-        params (ParamsT): Iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): Learning rate.
-        betas (Betas): Coefficients used for computing running averages of gradient and the squared Hessian trace.
-        weight_decay (float): Weight decay (L2 penalty).
-        weight_decouple (bool): The optimizer uses decoupled weight decay as in AdamW.
-        fixed_decay (bool): Fix weight decay.
-        foreach (Optional[bool]): Whether to use foreach (multi-tensor) operations for speed.
-            None means auto-detect based on device (True for CUDA, False otherwise).
-        maximize (bool): Maximize the objective with respect to the params, instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate. A scalar tensor avoids recompilation when the rate changes.
+        betas: Decay rates for update interpolation and gradient momentum.
+        weight_decay: Weight decay coefficient.
+        weight_decouple: Apply weight decay to parameters instead of adding it to the gradient.
+        fixed_decay: Apply decoupled weight decay without scaling it by the learning rate.
+        foreach: Use batched tensor operations. `None` enables them for supported parameter groups.
+        maximize: Maximize the objective instead of minimizing it.
 
     """
+
+    _supports_compiled_foreach = True
 
     def __init__(
         self,
         params: ParamsT,
-        lr: float = 1e-4,
+        lr: float | torch.Tensor = 1e-4,
         betas: Betas = (0.9, 0.99),
         weight_decay: float = 0.0,
         weight_decouple: bool = True,
         fixed_decay: bool = False,
-        foreach: Optional[bool] = None,
+        foreach: bool | None = None,
         maximize: bool = False,
         **kwargs,
     ):
@@ -79,12 +80,9 @@ class Lion(BaseOptimizer):
                     state['exp_grad_adanorm'] = torch.zeros((1,), dtype=grad.dtype, device=grad.device)
 
     def _can_use_foreach(self, group: ParamGroup) -> bool:
-        """Check if foreach can be used for this group.
+        """Check tensor compatibility and options for batched updates.
 
-        Foreach is disabled when using features that require per-parameter handling:
-        - Gradient centralization
-        - AdaNorm
-        - Cautious updates
+        Disable batched updates when using gradient centralization, AdaNorm, or cautious updates.
         """
         if group.get('foreach') is False:
             return False
@@ -97,9 +95,9 @@ class Lion(BaseOptimizer):
     def _step_foreach(
         self,
         group: ParamGroup,
-        params: List[torch.Tensor],
-        grads: List[torch.Tensor],
-        exp_avgs: List[torch.Tensor],
+        params: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        exp_avgs: list[torch.Tensor],
     ) -> None:
         beta1, beta2 = group['betas']
         lr = group['lr']
@@ -116,14 +114,12 @@ class Lion(BaseOptimizer):
             fixed_decay=group['fixed_decay'],
         )
 
-        updates = torch._foreach_mul(exp_avgs, beta1)
-        torch._foreach_add_(updates, grads, alpha=1.0 - beta1)
+        updates = torch._foreach_lerp(exp_avgs, grads, weight=1.0 - beta1)
         torch._foreach_sign_(updates)
 
-        torch._foreach_mul_(exp_avgs, beta2)
-        torch._foreach_add_(exp_avgs, grads, alpha=1.0 - beta2)
+        torch._foreach_lerp_(exp_avgs, grads, weight=1.0 - beta2)
 
-        torch._foreach_add_(params, updates, alpha=-lr)
+        foreach_add_(params, updates, alpha=-lr)
 
     def _step_per_param(self, group: ParamGroup) -> None:
         beta1, beta2 = group['betas']
@@ -161,15 +157,16 @@ class Lion(BaseOptimizer):
                 r=group.get('adanorm_r', None),
             )
 
-            update = exp_avg.clone()
-
-            update.mul_(beta1).add_(grad, alpha=1.0 - beta1).sign_()
-            exp_avg.mul_(beta2).add_(s_grad, alpha=1.0 - beta2)
+            update = exp_avg.lerp(grad, weight=1.0 - beta1).sign_()
+            exp_avg.lerp_(s_grad, weight=1.0 - beta2)
 
             if group.get('cautious'):
                 self.apply_cautious(update, grad)
 
-            p.add_(update, alpha=-group['lr'])
+            if isinstance(group['lr'], torch.Tensor):
+                p.add_(update * -group['lr'])
+            else:
+                p.add_(update, alpha=-group['lr'])
 
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
@@ -184,8 +181,8 @@ class Lion(BaseOptimizer):
 
             if self._can_use_foreach(group):
                 params, grads, state_dict = self.collect_trainable_params(group, self.state, state_keys=['exp_avg'])
-                if params:
-                    self._step_foreach(group, params, grads, state_dict['exp_avg'])
+                for tensors in group_tensors_by_device_and_dtype(params, grads, state_dict):
+                    self._step_foreach(group, tensors['params'], tensors['grads'], tensors['exp_avg'])
             else:
                 self._step_per_param(group)
 

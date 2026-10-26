@@ -1,30 +1,32 @@
 import math
-from typing import Callable, List, Optional
+from collections.abc import Callable
 
 import torch
 
 from pytorch_optimizer.base.exception import NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Betas, Closure, Defaults, Loss, ParamGroup, ParamsT
+from pytorch_optimizer.optimizer.utils.foreach import foreach_add_, group_tensors_by_device_and_dtype
 
 
 class ADOPT(BaseOptimizer):
-    """Modified Adam Can Converge with Any β2 with the Optimal Rate.
+    """Adaptive updates using the previous second moment and gradient clipping.
 
     Args:
-        params (ParamsT): Iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): Learning rate.
-        betas (Betas): Coefficients used for computing running averages of gradient and the squared Hessian trace.
-        clip_lambda (Callable[[float], float]): Function to clip gradient. Default is `step ** 0.25`.
-        weight_decay (float): Weight decay (L2 penalty).
-        weight_decouple (bool): Whether to use decoupled weight decay as in AdamW.
-        fixed_decay (bool): Apply fixed weight decay instead of adaptive.
-        foreach (Optional[bool]): Whether to use foreach (multi-tensor) operations for speed.
-            None means auto-detect based on device (True for CUDA, False otherwise).
-        eps (float): Term added to the denominator to improve numerical stability.
-        maximize (bool): Maximize the objective with respect to the parameters, instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        betas: Decay rates for the first and second moments.
+        clip_lambda: Function to clip gradient. Default is `step ** 0.25`.
+        weight_decay: Weight decay coefficient.
+        weight_decouple: Apply weight decay to parameters instead of adding it to the gradient.
+        fixed_decay: Apply decoupled weight decay without scaling it by the learning rate.
+        foreach: Use batched tensor operations. `None` enables them for supported parameter groups.
+        eps: Term added to the denominator to improve numerical stability.
+        maximize: Maximize the objective instead of minimizing it.
 
     """
+
+    _supports_compiled_foreach = True
 
     def __init__(
         self,
@@ -35,7 +37,7 @@ class ADOPT(BaseOptimizer):
         weight_decay: float = 0.0,
         weight_decouple: bool = False,
         fixed_decay: bool = False,
-        foreach: Optional[bool] = None,
+        foreach: bool | None = None,
         eps: float = 1e-6,
         maximize: bool = False,
         **kwargs,
@@ -95,10 +97,12 @@ class ADOPT(BaseOptimizer):
     def _step_foreach(
         self,
         group: ParamGroup,
-        params: List[torch.Tensor],
-        grads: List[torch.Tensor],
-        exp_avgs: List[torch.Tensor],
-        exp_avg_sqs: List[torch.Tensor],
+        params: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        exp_avgs: list[torch.Tensor],
+        exp_avg_sqs: list[torch.Tensor],
+        first_step: bool,
+        clip: float | torch.Tensor | None,
     ) -> None:
         beta1, beta2 = group['betas']
         lr = group['lr']
@@ -116,7 +120,7 @@ class ADOPT(BaseOptimizer):
             fixed_decay=group['fixed_decay'],
         )
 
-        if group['step'] == 1:
+        if first_step:
             torch._foreach_addcmul_(exp_avg_sqs, grads, grads)
             return
 
@@ -124,14 +128,15 @@ class ADOPT(BaseOptimizer):
         torch._foreach_clamp_min_(de_noms, eps)
 
         normed_grads = torch._foreach_div(grads, de_noms)
-        if self.clip_lambda is not None:
-            clip: float = self.clip_lambda(group['step'])
-            torch._foreach_clamp_min_(normed_grads, -clip)
-            torch._foreach_clamp_max_(normed_grads, clip)
+        if clip is not None:
+            lower = [-clip] * len(normed_grads) if isinstance(clip, torch.Tensor) else -clip
+            upper = [clip] * len(normed_grads) if isinstance(clip, torch.Tensor) else clip
+            torch._foreach_maximum_(normed_grads, lower)
+            torch._foreach_minimum_(normed_grads, upper)
 
         torch._foreach_lerp_(exp_avgs, normed_grads, weight=1.0 - beta1)
 
-        torch._foreach_add_(params, exp_avgs, alpha=-lr)
+        foreach_add_(params, exp_avgs, alpha=-lr)
 
         torch._foreach_mul_(exp_avg_sqs, beta2)
         torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
@@ -169,7 +174,8 @@ class ADOPT(BaseOptimizer):
 
             de_nom = exp_avg_sq.sqrt().clamp_(min=group['eps'])
 
-            normed_grad = grad.div(de_nom)
+            normed_grad = de_nom
+            torch.div(grad, de_nom, out=normed_grad)
             if self.clip_lambda is not None:
                 clip = self.clip_lambda(group['step'])
                 normed_grad.clamp_(-clip, clip)
@@ -182,11 +188,10 @@ class ADOPT(BaseOptimizer):
             else:
                 update = exp_avg
 
-            step_lr = lr
             if group.get('stable_adamw'):
-                step_lr /= self.get_stable_adamw_rms(grad, exp_avg_sq)
+                update = update / self.get_stable_adamw_rms(grad, exp_avg_sq)
 
-            p.add_(update, alpha=-step_lr)
+            p.add_(update, alpha=-lr)
 
             exp_avg_sq.mul_(beta2).addcmul_(grad, grad.conj(), value=1.0 - beta2)
 
@@ -205,8 +210,17 @@ class ADOPT(BaseOptimizer):
                 params, grads, state_dict = self.collect_trainable_params(
                     group, self.state, state_keys=['exp_avg', 'exp_avg_sq']
                 )
-                if params:
-                    self._step_foreach(group, params, grads, state_dict['exp_avg'], state_dict['exp_avg_sq'])
+                clip = self.clip_lambda(group['step']) if self.clip_lambda is not None and group['step'] > 1 else None
+                for tensors in group_tensors_by_device_and_dtype(params, grads, state_dict):
+                    self._step_foreach(
+                        group,
+                        tensors['params'],
+                        tensors['grads'],
+                        tensors['exp_avg'],
+                        tensors['exp_avg_sq'],
+                        group['step'] == 1,
+                        clip,
+                    )
             else:
                 self._step_per_param(group)
 

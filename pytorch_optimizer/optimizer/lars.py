@@ -1,28 +1,30 @@
-from typing import List, Optional
-
 import torch
 
 from pytorch_optimizer.base.exception import NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Closure, Defaults, Loss, ParamGroup, ParamsT
+from pytorch_optimizer.optimizer.utils.foreach import foreach_add_, group_tensors_by_device_and_dtype
 
 
 class LARS(BaseOptimizer):
-    """Layer-wise Adaptive Rate Scaling (no rate scaling or weight decay for parameters <= 1D).
+    """SGD with learning rates scaled by parameter and gradient norms.
+
+    Scalars and vectors use ordinary SGD without weight decay or rate scaling.
 
     Args:
-        params (ParamsT): Iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): Learning rate.
-        weight_decay (float): Weight decay (L2 penalty).
-        momentum (float): Momentum.
-        dampening (float): Dampening for momentum.
-        trust_coefficient (float): Trust coefficient.
-        nesterov (bool): Enables Nesterov momentum.
-        foreach (Optional[bool]): Whether to use foreach (multi-tensor) operations for speed.
-            None means auto-detect based on device (True for CUDA, False otherwise).
-        maximize (bool): Maximize the objective with respect to the params, instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        weight_decay: Weight decay coefficient.
+        momentum: Momentum factor.
+        dampening: Dampening factor for momentum.
+        trust_coefficient: Trust coefficient.
+        nesterov: Use Nesterov momentum.
+        foreach: Use batched tensor operations. `None` enables them for supported parameter groups.
+        maximize: Maximize the objective instead of minimizing it.
 
     """
+
+    _supports_compiled_foreach = True
 
     def __init__(
         self,
@@ -33,7 +35,7 @@ class LARS(BaseOptimizer):
         dampening: float = 0.0,
         trust_coefficient: float = 1e-3,
         nesterov: bool = False,
-        foreach: Optional[bool] = None,
+        foreach: bool | None = None,
         maximize: bool = False,
         **kwargs,
     ):
@@ -77,28 +79,17 @@ class LARS(BaseOptimizer):
                 state = self.state[p]
 
                 if 'momentum_buffer' not in state:
-                    state['momentum_buffer'] = grad.clone()
+                    state['momentum_buffer'] = torch.zeros_like(p)
 
     def _can_use_foreach(self, group: ParamGroup) -> bool:
-        """Check if foreach can be used for this group.
-
-        Foreach is disabled when using features that require per-parameter handling:
-        - Nesterov momentum (requires per-parameter gradient modification)
-        """
-        if group.get('foreach') is False:
-            return False
-
-        if group.get('nesterov'):
-            return False
-
         return self.can_use_foreach(group, group.get('foreach'))
 
     def _step_foreach(
         self,
         group: ParamGroup,
-        params: List[torch.Tensor],
-        grads: List[torch.Tensor],
-        momentum_buffers: List[torch.Tensor],
+        params: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        momentum_buffers: list[torch.Tensor],
     ) -> None:
         if self.maximize:
             torch._foreach_neg_(grads)
@@ -108,18 +99,14 @@ class LARS(BaseOptimizer):
         masked_grads = [g for g, m in zip(grads, masks) if m]
 
         if masked_params:
-            param_norms = torch._foreach_norm(masked_params)
-            grad_norms = torch._foreach_norm(masked_grads)
-
-            trust_ratios = []
-            for pn, gn in zip(param_norms, grad_norms):
-                one = torch.ones_like(pn)
-                trust_ratio = torch.where(
-                    pn > 0.0,
-                    torch.where(gn > 0.0, (group['trust_coefficient'] * pn / gn), one),
-                    one,
-                )
-                trust_ratios.append(trust_ratio)
+            param_norms = torch.stack(torch._foreach_norm(masked_params))
+            grad_norms = torch.stack(torch._foreach_norm(masked_grads))
+            denominator = grad_norms + group['weight_decay'] * param_norms
+            trust_ratios = torch.where(
+                param_norms > 0.0,
+                torch.where(denominator > 0.0, group['trust_coefficient'] * param_norms / denominator, 1.0),
+                1.0,
+            ).unbind()
 
             torch._foreach_add_(masked_grads, masked_params, alpha=group['weight_decay'])
             torch._foreach_mul_(masked_grads, trust_ratios)
@@ -127,9 +114,12 @@ class LARS(BaseOptimizer):
         if group['momentum'] > 0.0:
             torch._foreach_mul_(momentum_buffers, group['momentum'])
             torch._foreach_add_(momentum_buffers, grads, alpha=1.0 - group['dampening'])
-            torch._foreach_copy_(grads, momentum_buffers)
+            if group['nesterov']:
+                torch._foreach_add_(grads, momentum_buffers, alpha=group['momentum'])
+            else:
+                torch._foreach_copy_(grads, momentum_buffers)
 
-        torch._foreach_add_(params, grads, alpha=-group['lr'])
+        foreach_add_(params, grads, alpha=-group['lr'])
 
     def _step_per_param(self, group: ParamGroup) -> None:
         for p in group['params']:
@@ -147,10 +137,11 @@ class LARS(BaseOptimizer):
                 update_norm = torch.linalg.norm(grad)
 
                 one = torch.ones_like(param_norm)
+                denominator = update_norm + group['weight_decay'] * param_norm
 
                 trust_ratio = torch.where(
                     param_norm > 0.0,
-                    torch.where(update_norm > 0.0, (group['trust_coefficient'] * param_norm / update_norm), one),
+                    torch.where(denominator > 0.0, (group['trust_coefficient'] * param_norm / denominator), one),
                     one,
                 )
 
@@ -179,12 +170,12 @@ class LARS(BaseOptimizer):
             self.init_group(group)
             group['step'] += 1
 
-            if self._can_use_foreach(group) and group['momentum'] > 0.0:
+            if self._can_use_foreach(group):
                 params, grads, state_dict = self.collect_trainable_params(
-                    group, self.state, state_keys=['momentum_buffer']
+                    group, self.state, state_keys=['momentum_buffer'] if group['momentum'] > 0.0 else []
                 )
-                if params:
-                    self._step_foreach(group, params, grads, state_dict['momentum_buffer'])
+                for tensors in group_tensors_by_device_and_dtype(params, grads, state_dict):
+                    self._step_foreach(group, tensors['params'], tensors['grads'], tensors.get('momentum_buffer', []))
             else:
                 self._step_per_param(group)
 

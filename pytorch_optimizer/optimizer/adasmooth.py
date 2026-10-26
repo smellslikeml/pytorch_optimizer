@@ -3,33 +3,38 @@ import torch
 from pytorch_optimizer.base.exception import NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Betas, Closure, Defaults, Loss, ParamGroup, ParamsT
+from pytorch_optimizer.optimizer.utils.foreach import foreach_scalar_div_, group_tensors_by_device_and_dtype
 
 
 class AdaSmooth(BaseOptimizer):
-    """An Adaptive Learning Rate Method based on Effective Ratio.
+    """Adaptive updates with effective ratio smoothing.
 
     Args:
-        params (ParamsT): Iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float): Learning rate.
-        betas (Betas): Coefficients used for computing running averages of gradient and the squared Hessian trace.
-        weight_decay (float): Weight decay (L2 penalty).
-        weight_decouple (bool): Whether to use decoupled weight decay as in AdamW.
-        fixed_decay (bool): Apply fixed weight decay instead of adaptive.
-        eps (float): Term added to the denominator to improve numerical stability.
-        maximize (bool): Maximize the objective with respect to the parameters, instead of minimizing.
+        params: Parameters to optimize or dictionaries defining parameter groups.
+        lr: Learning rate.
+        betas: Lower and upper smoothing bounds for the effective ratio adaptation.
+        weight_decay: Weight decay coefficient.
+        weight_decouple: Apply weight decay to parameters instead of adding it to the gradient.
+        fixed_decay: Apply decoupled weight decay without scaling it by the learning rate.
+        eps: Term added to the denominator to improve numerical stability.
+        maximize: Maximize the objective instead of minimizing it.
+        foreach: Use batched tensor operations. `None` enables them for supported parameter groups.
 
     """
+
+    _supports_compiled_foreach = True
 
     def __init__(
         self,
         params: ParamsT,
-        lr: float = 1e-3,
+        lr: float | torch.Tensor = 1e-3,
         betas: Betas = (0.5, 0.99),
         weight_decay: float = 0.0,
         weight_decouple: bool = False,
         fixed_decay: bool = False,
         eps: float = 1e-6,
         maximize: bool = False,
+        foreach: bool | None = None,
         **kwargs,
     ):
         self.validate_learning_rate(lr)
@@ -38,6 +43,7 @@ class AdaSmooth(BaseOptimizer):
         self.validate_non_negative(eps, 'eps')
 
         self.maximize = maximize
+        self.foreach = foreach
 
         defaults: Defaults = {
             'lr': lr,
@@ -45,6 +51,7 @@ class AdaSmooth(BaseOptimizer):
             'weight_decay': weight_decay,
             'weight_decouple': weight_decouple,
             'fixed_decay': fixed_decay,
+            'foreach': foreach,
             'eps': eps,
             **kwargs,
         }
@@ -69,10 +76,48 @@ class AdaSmooth(BaseOptimizer):
             state = self.state[p]
 
             if len(state) == 0:
-                state['prev_param'] = torch.zeros_like(p)
+                state['prev_param'] = p.clone()
                 state['s'] = torch.zeros_like(p)
                 state['n'] = torch.zeros_like(p)
                 state['exp_avg_sq'] = torch.zeros_like(p)
+
+    def _step_foreach(
+        self,
+        group: ParamGroup,
+        params: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        state: dict[str, list[torch.Tensor]],
+    ) -> None:
+        beta1, beta2 = group['betas']
+        ss, ns, prev_params, exp_avg_sqs = state['s'], state['n'], state['prev_param'], state['exp_avg_sq']
+
+        if self.maximize:
+            torch._foreach_neg_(grads)
+
+        self.apply_weight_decay_foreach(
+            params, grads, group['lr'], group['weight_decay'], group['weight_decouple'], group['fixed_decay']
+        )
+
+        diffs = torch._foreach_sub(params, prev_params)
+        torch._foreach_add_(ss, diffs)
+        torch._foreach_add_(ns, torch._foreach_abs(diffs))
+
+        weights = torch._foreach_abs(ss)
+        torch._foreach_div_(weights, torch._foreach_add(ns, group['eps']))
+        torch._foreach_mul_(weights, beta2 - beta1)
+        torch._foreach_add_(weights, 1.0 - beta2)
+        torch._foreach_pow_(weights, 2)
+        torch._foreach_lerp_(exp_avg_sqs, torch._foreach_mul(grads, grads), weights)
+
+        de_noms = torch._foreach_add(exp_avg_sqs, group['eps'])
+        torch._foreach_sqrt_(de_noms)
+        updates = de_noms
+        foreach_scalar_div_(updates, group['lr'])
+        torch._foreach_mul_(updates, grads)
+
+        torch._foreach_copy_(prev_params, params)
+        torch._foreach_neg_(updates)
+        torch._foreach_add_(params, updates)
 
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
@@ -86,6 +131,14 @@ class AdaSmooth(BaseOptimizer):
             group['step'] += 1
 
             beta1, beta2 = group['betas']
+
+            if self.can_use_foreach(group, group.get('foreach', self.foreach)):
+                params, grads, state = self.collect_trainable_params(
+                    group, self.state, state_keys=['s', 'n', 'prev_param', 'exp_avg_sq']
+                )
+                for batch in group_tensors_by_device_and_dtype(params, grads, state):
+                    self._step_foreach(group, batch['params'], batch['grads'], batch)
+                continue
 
             for p in group['params']:
                 if p.grad is None:
@@ -115,18 +168,18 @@ class AdaSmooth(BaseOptimizer):
                 s.add_(p_diff)
                 n.add_(p_diff.abs())
 
-                c = s.sum().abs_().div_(n.sum().add_(group['eps']))  # e_t
+                c = s.abs().div_(n.add(group['eps']))
                 c.mul_(beta2 - beta1).add_(1.0 - beta2)
 
                 c_p2 = c.pow(2)
 
-                exp_avg_sq.mul_(1.0 - c_p2).addcmul_(grad, grad, value=c_p2)
+                exp_avg_sq.lerp_(grad.square(), weight=c_p2)
 
                 step_size = torch.full_like(exp_avg_sq, fill_value=group['lr'])
                 step_size.div_((exp_avg_sq + group['eps']).sqrt()).mul_(grad)
 
-                p.add_(-step_size)
-
                 state['prev_param'].copy_(torch.view_as_complex(p) if torch.is_complex(state['prev_param']) else p)
+
+                p.add_(-step_size)
 
         return loss

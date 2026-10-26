@@ -1,5 +1,7 @@
 # Utilities
 
+Use these helpers to find registered components, manage gradients, and offload optimizer work to the CPU.
+
 ::: pytorch_optimizer.get_supported_optimizers
     :docstring:
     :members:
@@ -57,5 +59,13 @@
     :members:
 
 ::: pytorch_optimizer.optimizer.utils.copy_stochastic
+    :docstring:
+    :members:
+
+::: pytorch_optimizer.optimizer.utils.batched_power_iteration
+    :docstring:
+    :members:
+
+::: pytorch_optimizer.optimizer.utils.compute_power_newton_db
     :docstring:
     :members:

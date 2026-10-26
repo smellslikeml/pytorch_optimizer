@@ -1,9 +1,18 @@
-name: Publish
+name: Release
+run-name: Release / ${{ github.ref_name }}
 
 on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version component to increment
+        required: true
+        type: choice
+        default: patch
+        options: [major, minor, patch]
 
 permissions:
   contents: read
@@ -13,85 +22,212 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: Create Release
+  guard:
+    name: Guard Release Ref
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - name: Generate release notes and create release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          generate_release_notes: true
-          draft: false
-          prerelease: false
-          name: pytorch-optimizer ${{ github.ref_name }}
-          tag_name: ${{ github.ref_name }}
-          token: ${{ secrets.GH_TOKEN }}
+      - name: Require main for manual releases
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' && "$GITHUB_REF" != 'refs/heads/main' ]]; then
+            echo "Run manual releases from main, not $GITHUB_REF" >&2
+            exit 1
+          fi
 
-  changelog:
-    name: Update Changelogs
+  validate:
+    name: Validate
+    needs: guard
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ github.sha }}
+      skip_coverage_upload: true
+
+  prepare:
+    name: Prepare Release
+    needs: validate
     runs-on: ubuntu-latest
-    needs: release
     permissions:
       contents: write
       pull-requests: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      ref: ${{ steps.commit.outputs.ref }}
+      notes: ${{ steps.notes.outputs.body }}
     steps:
-      - name: Checkout main
+      - name: Checkout release ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-
-      - name: Update changelogs from the published release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          gh release view "$RELEASE_TAG" --json body --jq .body > "$RUNNER_TEMP/release-notes.md"
-          python scripts/update_changelog.py "$RELEASE_TAG" "$RUNNER_TEMP/release-notes.md"
-
-      - name: Create changelog pull request
-        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
-        with:
-          branch: docs/changelog-update-${{ github.ref_name }}
-          commit-message: "docs: update changelogs for ${{ github.ref_name }}"
-          title: "docs: update changelogs for ${{ github.ref_name }}"
-          body: "Sync the generated release notes from https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }} into CHANGELOG.md and the documentation."
-          base: main
-          add-paths: |
-            CHANGELOG.md
-            docs/changelogs/${{ github.ref_name }}.md
-            docs/changelogs/index.md
-          delete-branch: true
-          labels: automerge
-          token: ${{ secrets.GH_TOKEN }}
-
-  deploy:
-    name: Deploy
-    runs-on: ubuntu-latest
-    needs: changelog
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          token: ${{ github.token }}
 
       - name: Setup uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          python-version: 3.12
-          enable-cache: true
-          prune-cache: false
+          python-version: '3.12'
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install dependencies
-        run: uv sync --frozen --no-dev
+      - name: Validate and bump package version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          uv lock --check
+          current="$(uv version --short)"
+          if [[ ! "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Package version must have the form MAJOR.MINOR.PATCH' >&2
+            exit 1
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]]; then
+            version="$(uv version --bump "$BUMP" --no-sync --short)"
+            tag="v$version"
+            if git rev-parse --verify --quiet "refs/tags/$tag"; then
+              echo "Tag $tag already exists" >&2
+              exit 1
+            fi
+          else
+            tag="$GITHUB_REF_NAME"
+            if [[ "$tag" != "v$current" ]]; then
+              echo "Tag $tag does not match package version $current" >&2
+              exit 1
+            fi
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes and update changelogs
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh api --method POST "repos/$GH_REPO/releases/generate-notes" \
+            -f tag_name="$RELEASE_TAG" -f target_commitish="$GITHUB_SHA" \
+            --jq .body > "$RUNNER_TEMP/release-notes.md"
+          uv run --no-project python scripts/update_changelog.py "$RELEASE_TAG" "$RUNNER_TEMP/release-notes.md"
+
+          delimiter="release_notes_${RANDOM}_${RANDOM}_${RANDOM}"
+          {
+            echo "body<<$delimiter"
+            cat "$RUNNER_TEMP/release-notes.md"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create release preparation pull request
+        id: release_pr
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          branch: release/prepare-${{ steps.version.outputs.tag }}
+          commit-message: 'build: prepare release ${{ steps.version.outputs.tag }}'
+          title: 'build: prepare release ${{ steps.version.outputs.tag }}'
+          body: >-
+            Prepare the package version, lockfile, and generated changelogs for ${{ steps.version.outputs.tag }}.
+            This pull request must merge before package publishing and GitHub release creation.
+          base: main
+          add-paths: |
+            pyproject.toml
+            uv.lock
+            CHANGELOG.md
+            docs/changelogs/${{ steps.version.outputs.tag }}.md
+            docs/changelogs/index.md
+          delete-branch: true
+          token: ${{ github.token }}
+
+      - name: Merge release preparation pull request and resolve release commit
+        id: commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.release_pr.outputs.pull-request-number }}
+          PR_HEAD_SHA: ${{ steps.release_pr.outputs.pull-request-head-sha }}
+        run: |
+          if [[ -z "$PR_NUMBER" || -z "$PR_HEAD_SHA" ]]; then
+            echo 'No release preparation pull request was created' >&2
+            exit 1
+          fi
+          for attempt in {1..10}; do
+            mergeable="$(gh pr view "$PR_NUMBER" --json mergeable --jq .mergeable)"
+            if [[ "$mergeable" != 'UNKNOWN' ]]; then
+              break
+            fi
+            sleep 3
+          done
+          if [[ "$mergeable" == 'UNKNOWN' ]]; then
+            echo 'GitHub has not finished calculating PR mergeability' >&2
+            exit 1
+          fi
+          gh pr merge "$PR_NUMBER" --squash --delete-branch --match-head-commit "$PR_HEAD_SHA"
+          merged_ref="$(gh pr view "$PR_NUMBER" --json state,mergeCommit \
+            --jq 'if .state == "MERGED" then .mergeCommit.oid else empty end')"
+          if [[ -z "$merged_ref" ]]; then
+            echo 'The release preparation pull request must be merged before publishing' >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]]; then
+            ref="$merged_ref"
+          else
+            ref="$GITHUB_SHA"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Publish Package
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: '3.12'
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build package
+        run: uv build
+
+      - name: Create and push release tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_REF: ${{ needs.prepare.outputs.ref }}
+        run: |
+          if git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            if [[ "$(git rev-list -n 1 "$RELEASE_TAG")" != "$RELEASE_REF" ]]; then
+              echo "Tag $RELEASE_TAG points to a different commit" >&2
+              exit 1
+            fi
+          else
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git tag -a "$RELEASE_TAG" -m "pytorch-optimizer $RELEASE_TAG"
+            git push origin "refs/tags/$RELEASE_TAG"
+          fi
 
       - name: Publish package to PyPI
-        env:
-          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
-        run: |
-          uv build
-          uv publish
+        run: uv publish --trusted-publishing always --check-url https://pypi.org/simple
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [prepare, deploy]
+    permissions:
+      contents: write
+    steps:
+      - name: Create release with the prepared notes
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          body: ${{ needs.prepare.outputs.notes }}
+          draft: false
+          prerelease: false
+          name: pytorch-optimizer ${{ needs.prepare.outputs.tag }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ needs.prepare.outputs.ref }}
+          token: ${{ github.token }}

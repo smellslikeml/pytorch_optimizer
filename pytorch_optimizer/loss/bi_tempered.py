@@ -1,26 +1,26 @@
-from typing import Optional, Tuple, cast
+from typing import cast
 
 import torch
 from torch import nn
 
 
 def log_t(u: torch.Tensor, t: float) -> torch.Tensor:
-    """Compute log_t for `u'."""
+    """Compute the tempered logarithm of `u`."""
     return u.log() if t == 1.0 else (u.pow(1.0 - t) - 1.0) / (1.0 - t)
 
 
 def exp_t(u: torch.Tensor, t: float) -> torch.Tensor:
-    """Compute exp_t for `u'."""
+    """Compute the tempered exponential of `u`."""
     return u.exp() if t == 1 else (1.0 + (1.0 - t) * u).relu().pow(1.0 / (1.0 - t))
 
 
 def compute_normalization_fixed_point(activations: torch.Tensor, t: float, num_iters: int) -> torch.Tensor:
-    r"""Return the normalization value for each example (t > 1.0).
+    """Return the normalization value for each example (t > 1.0).
 
     Args:
-        activations (torch.Tensor): A multi-dimensional tensor with the last dimension representing classes.
-        t (float): Temperature value (> 1.0 for tail heaviness).
-        num_iters (int): Number of iterations to run the method.
+        activations: A multidimensional tensor with the last dimension representing classes.
+        t: Temperature value (> 1.0 for tail heaviness).
+        num_iters: Number of iterations to run the method.
 
     """
     mu, _ = torch.max(activations, dim=-1, keepdim=True)
@@ -42,9 +42,9 @@ def compute_normalization_binary_search(activations: torch.Tensor, t: float, num
     """Compute normalization value for each example (t < 1.0).
 
     Args:
-        activations (torch.Tensor): A multidimensional tensor with the last dimension `num_classes`.
-        t (float): Temperature parameter (< 1.0 for peak sharpening).
-        num_iters (int): Number of iterations to run the normalization.
+        activations: A multidimensional tensor with the last dimension `num_classes`.
+        t: Temperature parameter (< 1.0 for peak sharpening).
+        num_iters: Number of iterations to run the normalization.
 
     """
     mu, _ = torch.max(activations, dim=-1, keepdim=True)
@@ -54,7 +54,7 @@ def compute_normalization_binary_search(activations: torch.Tensor, t: float, num
         activations.dtype
     )
 
-    shape_partition: Tuple[int, ...] = (*activations.shape[:-1], 1)
+    shape_partition: tuple[int, ...] = (*activations.shape[:-1], 1)
 
     lower = torch.zeros(shape_partition, dtype=activations.dtype, device=activations.device)
     upper = -log_t(1.0 / effective_dim, t) * torch.ones_like(lower)
@@ -72,7 +72,7 @@ def compute_normalization_binary_search(activations: torch.Tensor, t: float, num
 
 
 class ComputeNormalization(torch.autograd.Function):
-    """Custom backward pass for compute_normalization. See compute_normalization."""
+    """Compute tempered normalization with a custom backward pass."""
 
     @staticmethod
     def forward(ctx, activations: torch.Tensor, t: float, num_iters: int) -> torch.Tensor:
@@ -102,24 +102,24 @@ class ComputeNormalization(torch.autograd.Function):
 
 
 def compute_normalization(activations: torch.Tensor, t: float, num_iters: int = 5) -> torch.Tensor:
-    r"""Compute normalization value for each example.
+    """Compute the normalization constant for each example.
 
     Args:
-        activations (torch.Tensor): A multi-dimensional tensor with the last dimension `num_classes`.
-        t (float): Temperature parameter (> 1.0 for tail heaviness).
-        num_iters (int): Number of iterations to run the method.
+        activations: A multidimensional tensor with the last dimension `num_classes`.
+        t: Temperature. Values above 1 give heavy tails. Values below 1 give finite support.
+        num_iters: Number of iterations to run the method.
 
     """
     return cast(torch.Tensor, ComputeNormalization.apply(activations, t, num_iters))
 
 
 def tempered_softmax(activations: torch.Tensor, t: float, num_iters: int = 5) -> torch.Tensor:
-    """Tempered softmax function.
+    """Compute tempered softmax probabilities along the last dimension.
 
     Args:
-        activations (torch.Tensor): A multidimensional tensor with last dimension `num_classes`.
-        t (float): Temperature parameter (> 1.0 for tail heaviness).
-        num_iters (int): Number of iterations to run the method.
+        activations: A multidimensional tensor with last dimension `num_classes`.
+        t: Temperature. `1` gives standard softmax. Other values use tempered normalization.
+        num_iters: Number of iterations to run the method.
 
     """
     if t == 1.0:
@@ -139,22 +139,25 @@ def bi_tempered_logistic_loss(
     num_iters: int = 5,
     reduction: str = 'mean',
 ) -> torch.Tensor:
-    r"""Bi-Tempered Logistic Loss.
+    """Compute bi-tempered logistic loss from logits and labels.
 
     Args:
-        activations (torch.Tensor): A multidimensional tensor with last dimension `num_classes`.
-        labels (torch.Tensor): Tensor with the same shape and dtype as activations (one-hot encoded),
-            or a long tensor with one dimension less (class indices).
-        t1 (float): Temperature 1 (< 1.0 for boundedness of loss).
-        t2 (float): Temperature 2 (> 1.0 for tail heaviness, < 1.0 for finite support).
-        label_smooth (float): Label smoothing parameter, between 0 and 1.
-        num_iters (int): Number of iterations to run the normalization method.
-        reduction (str): Specifies reduction method to apply to output: 'none', 'mean', or 'sum'.
+        activations: A multidimensional tensor with last dimension `num_classes`.
+        labels: Tensor with the same shape and dtype as activations (one-hot encoded), or a long tensor with one
+            dimension less (class indices).
+        t1: Temperature 1 (< 1.0 for boundedness of loss).
+        t2: Temperature 2 (> 1.0 for tail heaviness, < 1.0 for finite support).
+        label_smooth: Label smoothing parameter, between 0 and 1.
+        num_iters: Number of iterations to run the normalization method.
+        reduction: Specifies reduction method to apply to output: 'none', 'mean', or 'sum'.
+
+    Returns:
+        torch.Tensor: Loss with the class dimension reduced, followed by the requested reduction.
 
     """
     if len(labels.shape) < len(activations.shape):
         labels_onehot = torch.zeros_like(activations)
-        labels_onehot.scatter_(1, labels[..., None], 1)
+        labels_onehot.scatter_(-1, labels[..., None], 1)
     else:
         labels_onehot = labels
 
@@ -182,17 +185,17 @@ def bi_tempered_logistic_loss(
 
 
 class BiTemperedLogisticLoss(nn.Module):
-    """Bi-Tempered Log Loss.
+    """Bi-tempered logistic loss for multiclass predictions.
 
     Reference:
         https://github.com/BloodAxe/pytorch-toolbelt/blob/develop/pytorch_toolbelt/losses/bitempered_loss.py
 
     Args:
-        t1 (float): Temperature 1 (< 1.0 for boundedness).
-        t2 (float): Temperature 2 (> 1.0 for tail heaviness, < 1.0 for finite support).
-        label_smooth (float): Label smoothing parameter between 0 and 1.
-        ignore_index (Optional[int]): Index to ignore during loss calculation.
-        reduction (str): Type of reduction to apply to output, e.g. 'mean', 'sum', or 'none'.
+        t1: Temperature 1 (< 1.0 for boundedness).
+        t2: Temperature 2 (> 1.0 for tail heaviness, < 1.0 for finite support).
+        label_smooth: Label smoothing parameter between 0 and 1.
+        ignore_index: Index to ignore during loss calculation.
+        reduction: Type of reduction to apply to output, e.g. 'mean', 'sum', or 'none'.
 
     """
 
@@ -201,7 +204,7 @@ class BiTemperedLogisticLoss(nn.Module):
         t1: float,
         t2: float,
         label_smooth: float = 0.0,
-        ignore_index: Optional[int] = None,
+        ignore_index: int | None = None,
         reduction: str = 'mean',
     ):
         super().__init__()
@@ -212,31 +215,45 @@ class BiTemperedLogisticLoss(nn.Module):
         self.reduction = reduction
 
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Compute bi-tempered logistic loss for multiclass predictions.
+
+        Args:
+            predictions: Logits with classes along the last dimension.
+            targets: Class indices or one-hot labels. Use class indices with `ignore_index`.
+
+        Returns:
+            torch.Tensor: Per example loss or the requested scalar reduction.
+
+        """
+        mask = (
+            ~targets.eq(self.ignore_index)
+            if self.ignore_index is not None
+            else torch.ones_like(targets, dtype=torch.bool)
+        )
+        labels = targets.masked_fill(~mask, 0) if self.ignore_index is not None else targets
         loss = bi_tempered_logistic_loss(
-            predictions, targets, t1=self.t1, t2=self.t2, label_smooth=self.label_smooth, reduction='none'
+            predictions, labels, t1=self.t1, t2=self.t2, label_smooth=self.label_smooth, reduction='none'
         )
 
         if self.ignore_index is not None:
-            mask = ~targets.eq(self.ignore_index)
             loss *= mask
 
         if self.reduction == 'mean':
-            loss = loss.mean()
+            loss = loss.sum() / mask.sum().clamp_min(1) if self.ignore_index is not None else loss.mean()
         elif self.reduction == 'sum':
             loss = loss.sum()
         return loss
 
 
 class BinaryBiTemperedLogisticLoss(nn.Module):
-    """Bi-Tempered Logistic Loss for Binary Classification.
+    """Bi-tempered logistic loss for binary predictions.
 
     Args:
-        t1 (float): Temperature 1 (< 1.0 for boundedness of the loss).
-        t2 (float): Temperature 2 (> 1.0 for tail heaviness, < 1.0 for finite support).
-        label_smooth (float): Label smoothing parameter between 0 and 1.
-        ignore_index (Optional[int]): Specifies a target value that is ignored and does not contribute
-            to the input gradient.
-        reduction (str): Specifies the reduction to apply to the output: 'none', 'mean', or 'sum'.
+        t1: Temperature 1 (< 1.0 for boundedness of the loss).
+        t2: Temperature 2 (> 1.0 for tail heaviness, < 1.0 for finite support).
+        label_smooth: Label smoothing parameter between 0 and 1.
+        ignore_index: Specifies a target value that is ignored and does not contribute to the input gradient.
+        reduction: Specifies the reduction to apply to the output: 'none', 'mean', or 'sum'.
 
     """
 
@@ -245,7 +262,7 @@ class BinaryBiTemperedLogisticLoss(nn.Module):
         t1: float,
         t2: float,
         label_smooth: float = 0.0,
-        ignore_index: Optional[int] = None,
+        ignore_index: int | None = None,
         reduction: str = 'mean',
     ):
         super().__init__()
@@ -256,6 +273,19 @@ class BinaryBiTemperedLogisticLoss(nn.Module):
         self.reduction = reduction
 
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Compute bi-tempered logistic loss for binary predictions.
+
+        Args:
+            predictions: Logits with shape `(N, 1, ...)`.
+            targets: Binary labels with the same shape as `predictions`.
+
+        Returns:
+            torch.Tensor: Per entry loss or the requested scalar reduction.
+
+        Raises:
+            ValueError: Predictions or targets do not have exactly one channel.
+
+        """
         if predictions.size(1) != 1 or targets.size(1) != 1:
             raise ValueError('Channel dimension for predictions and targets must be equal to 1')
 

@@ -1,0 +1,227 @@
+import math
+from typing import Literal
+
+import torch
+
+from pytorch_optimizer.base.optimizer import BaseOptimizer
+from pytorch_optimizer.base.type import ParamGroup
+from pytorch_optimizer.optimizer.utils.foreach import foreach_add_
+
+PROJECTION_TYPE = Literal['std', 'reverse_std', 'right', 'left', 'full', 'random']
+
+
+def update_unprojected_foreach(
+    group: ParamGroup,
+    params: list[torch.Tensor],
+    grads: list[torch.Tensor],
+    exp_avgs: list[torch.Tensor],
+    exp_avg_sqs: list[torch.Tensor],
+    step_size: float | torch.Tensor,
+    decay_lr: float | torch.Tensor,
+    maximize: bool,
+    weight_decouple: bool = True,
+    fixed_decay: bool = False,
+) -> None:
+    """Update unprojected Adam moments and parameters."""
+    beta1, beta2 = group['betas']
+
+    if maximize:
+        torch._foreach_neg_(grads)
+
+    if not weight_decouple:
+        BaseOptimizer.apply_weight_decay_foreach(params, grads, decay_lr, group['weight_decay'], False, fixed_decay)
+
+    torch._foreach_lerp_(exp_avgs, grads, weight=1.0 - beta1)
+    torch._foreach_mul_(exp_avg_sqs, beta2)
+    torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
+
+    de_noms = torch._foreach_sqrt(exp_avg_sqs)
+    torch._foreach_add_(de_noms, group['eps'])
+    updates = torch._foreach_div(exp_avgs, de_noms)
+    foreach_add_(params, updates, alpha=-step_size)
+
+    if weight_decouple:
+        BaseOptimizer.apply_weight_decay_foreach(params, grads, decay_lr, group['weight_decay'], True, fixed_decay)
+
+
+class GaLoreProjector:
+    """Low rank projection and reconstruction of matrix gradients.
+
+    Args:
+        rank: Projection rank. `None` uses all available singular vectors.
+        update_proj_gap: Number of steps between projection updates.
+        scale: Multiplier applied when projecting updates back to the original shape.
+        projection_type: Type of projection. Supported types include 'std', 'reverse_std', 'right', 'left', 'full',
+            and 'random'.
+
+    """
+
+    def __init__(
+        self,
+        rank: int | None = 128,
+        update_proj_gap: int = 50,
+        scale: float = 1.0,
+        projection_type: PROJECTION_TYPE = 'std',
+        **kwargs,
+    ) -> None:
+        self.rank = rank
+        self.update_proj_gap = update_proj_gap
+        self.scale = scale
+        self.projection_type = projection_type
+
+        self.ortho_matrix: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None
+        self.last_svd_step: int = -1
+
+    def get_orthogonal_matrix(
+        self, weights: torch.Tensor, projection_type: str, from_random_matrix: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if projection_type not in ('right', 'left', 'full'):
+            raise ValueError('`projection_type` should be one of left, right or full')
+
+        original_type = weights.data.dtype
+        original_device = weights.data.device
+        is_float: bool = original_type == torch.float
+
+        if not from_random_matrix:
+            u, _, vh = torch.linalg.svd(weights if is_float else weights.float(), full_matrices=False)
+        elif isinstance(self.rank, int):
+            rank_sq: float = math.sqrt(self.rank)
+            u = torch.randn((weights.size(0), self.rank), device=original_device, dtype=original_type) / rank_sq
+            vh = torch.randn((self.rank, weights.size(1)), device=original_device, dtype=original_type) / rank_sq
+        else:
+            raise TypeError('`rank` should be int when `from_random_matrix` is True')
+
+        if projection_type == 'right':
+            b = vh[:self.rank, :] if isinstance(self.rank, int) else vh  # fmt: skip
+            return b.clone() if is_float else b.to(original_device).type(original_type)
+        if projection_type == 'left':
+            a = u[:, :self.rank] if isinstance(self.rank, int) else u  # fmt: skip
+            return a.clone() if is_float else a.to(original_device).type(original_type)
+
+        a = u[:, :self.rank] if isinstance(self.rank, int) else u  # fmt: skip
+        b = vh[:self.rank, :] if isinstance(self.rank, int) else vh  # fmt: skip
+
+        return (
+            (a.clone(), b.clone())
+            if is_float
+            else (a.to(original_device).type(original_type), b.to(original_device).type(original_type))
+        )
+
+    def get_low_rank_grad_std(self, grad: torch.Tensor) -> torch.Tensor:
+        if grad.shape[0] >= grad.shape[1]:
+            return torch.matmul(grad, self.ortho_matrix.t())
+        return torch.matmul(self.ortho_matrix.t(), grad)
+
+    def get_low_rank_grad_reverse_std(self, grad: torch.Tensor) -> torch.Tensor:
+        if grad.shape[0] >= grad.shape[1]:
+            return torch.matmul(self.ortho_matrix.t(), grad)
+        return torch.matmul(grad, self.ortho_matrix.t())
+
+    def get_low_rank_grad_right(self, grad: torch.Tensor) -> torch.Tensor:
+        return torch.matmul(grad, self.ortho_matrix.t())
+
+    def get_low_rank_grad_left(self, grad: torch.Tensor) -> torch.Tensor:
+        return torch.matmul(self.ortho_matrix.t(), grad)
+
+    def get_low_rank_grad_full(self, grad: torch.Tensor) -> torch.Tensor:
+        if not isinstance(self.ortho_matrix, tuple):
+            raise ValueError('self.ortho_matrix is not tuple')
+        return torch.matmul(self.ortho_matrix[0].t(), grad) @ self.ortho_matrix[1].t()
+
+    def get_low_rank_grad_random(self, grad: torch.Tensor) -> torch.Tensor:
+        is_right: bool = grad.size(0) >= grad.size(1)
+        return torch.matmul(grad, self.ortho_matrix.t()) if is_right else torch.matmul(self.ortho_matrix.t(), grad)
+
+    def update_ortho_matrix(self, x: torch.Tensor, from_random_matrix: bool) -> None:
+        is_right: bool = x.size(0) >= x.size(1)
+
+        if self.projection_type == 'std':
+            self.ortho_matrix = self.get_orthogonal_matrix(
+                x, projection_type='right' if is_right else 'left', from_random_matrix=from_random_matrix
+            )
+        elif self.projection_type == 'reverse_std':
+            self.ortho_matrix = self.get_orthogonal_matrix(
+                x, projection_type='left' if is_right else 'right', from_random_matrix=from_random_matrix
+            )
+        elif self.projection_type == 'right':
+            self.ortho_matrix = self.get_orthogonal_matrix(
+                x, projection_type='right', from_random_matrix=from_random_matrix
+            )
+        elif self.projection_type == 'left':
+            self.ortho_matrix = self.get_orthogonal_matrix(
+                x, projection_type='left', from_random_matrix=from_random_matrix
+            )
+        elif self.projection_type == 'full':
+            self.ortho_matrix = self.get_orthogonal_matrix(
+                x, projection_type='full', from_random_matrix=from_random_matrix
+            )
+        elif self.projection_type == 'random':
+            self.ortho_matrix = self.get_orthogonal_matrix(
+                x,
+                projection_type='right' if is_right else 'left',
+                from_random_matrix=from_random_matrix,
+            )
+        else:
+            raise NotImplementedError(f'unsupported projection_type: {self.projection_type}')
+
+    def project(
+        self,
+        grad: torch.Tensor,
+        num_steps: int,
+        svd_basis_matrix: torch.Tensor | None = None,
+        from_random_matrix: bool = False,
+    ) -> torch.Tensor:
+        update_ortho_matrix: bool = self.ortho_matrix is None or num_steps % self.update_proj_gap == 0
+        already_updated_this_step: bool = num_steps == self.last_svd_step
+
+        if update_ortho_matrix and not already_updated_this_step:
+            self.update_ortho_matrix(
+                x=grad if svd_basis_matrix is None else svd_basis_matrix,
+                from_random_matrix=from_random_matrix,
+            )
+            self.last_svd_step = num_steps
+
+        if self.projection_type == 'std':
+            return self.get_low_rank_grad_std(grad)
+        if self.projection_type == 'reverse_std':
+            return self.get_low_rank_grad_reverse_std(grad)
+        if self.projection_type == 'right':
+            return self.get_low_rank_grad_right(grad)
+        if self.projection_type == 'left':
+            return self.get_low_rank_grad_left(grad)
+        if self.projection_type == 'full':
+            return self.get_low_rank_grad_full(grad)
+        if self.projection_type == 'random':
+            return self.get_low_rank_grad_random(grad)
+
+        raise NotImplementedError
+
+    def project_back(self, low_rank_grad: torch.Tensor) -> torch.Tensor:
+        if self.projection_type == 'std':
+            return (
+                torch.matmul(low_rank_grad, self.ortho_matrix)
+                if low_rank_grad.shape[1] == self.ortho_matrix.shape[0]
+                else torch.matmul(self.ortho_matrix, low_rank_grad)
+            ).mul_(self.scale)
+        if self.projection_type == 'reverse_std':
+            return (
+                torch.matmul(self.ortho_matrix, low_rank_grad)
+                if low_rank_grad.shape[0] == self.ortho_matrix.shape[1]
+                else torch.matmul(low_rank_grad, self.ortho_matrix)
+            ).mul_(self.scale)
+        if self.projection_type == 'right':
+            return torch.matmul(low_rank_grad, self.ortho_matrix).mul_(self.scale)
+        if self.projection_type == 'left':
+            return torch.matmul(self.ortho_matrix, low_rank_grad).mul_(self.scale)
+        if self.projection_type == 'full':
+            if not isinstance(self.ortho_matrix, tuple):
+                raise ValueError('self.ortho_matrix is not tuple')
+            return (torch.matmul(self.ortho_matrix[0], low_rank_grad) @ self.ortho_matrix[1]).mul_(self.scale)
+        if self.projection_type == 'random':
+            return (
+                torch.matmul(low_rank_grad, self.ortho_matrix)
+                if low_rank_grad.shape[1] == self.ortho_matrix.shape[0]
+                else torch.matmul(self.ortho_matrix, low_rank_grad)
+            ).mul_(self.scale)
+
+        raise NotImplementedError

@@ -1,4 +1,5 @@
-from typing import Callable, Dict, List, Tuple
+from collections import OrderedDict
+from collections.abc import Callable, Sequence
 
 import torch
 from torch import nn
@@ -9,28 +10,22 @@ from pytorch_optimizer.base.type import Closure, Defaults, Loss, OptimizerInstan
 
 
 def polyval(x: torch.Tensor, coef: torch.Tensor) -> torch.Tensor:
-    r"""Implement Horner's scheme to evaluate a polynomial.
-
-    Taken from https://discuss.pytorch.org/t/polynomial-evaluation-by-horner-rule/67124
+    """Evaluate the error-function polynomial on the unit disk.
 
     Args:
-        x (torch.Tensor): Variable at which to evaluate the polynomial.
-        coef (torch.Tensor): Coefficients of the polynomial, ordered from highest degree to lowest.
+        x: Variable at which to evaluate the polynomial.
+        coef: Coefficients of the polynomial, ordered from highest degree to lowest.
 
     """
-    result = coef[0].clone()
-
-    for c in coef[1:]:
-        result = (result * x) + c
-
-    return result[0]
+    powers = x.unsqueeze(-1).expand(*x.shape, coef.numel() - 1).cumprod(dim=-1)
+    return ((powers * coef[:-1].flip(0)).sum(dim=-1) + coef[-1])[0]
 
 
 class ERF1994(nn.Module):
-    """Implementation of ERF1994.
+    """Approximate the complex error function using rational polynomials.
 
     Args:
-        num_coefs (int): The number of polynomial coefficients to use in the approximation.
+        num_coefs: The number of polynomial coefficients to use in the approximation.
 
     """
 
@@ -47,14 +42,15 @@ class ERF1994(nn.Module):
         self.theta = self.k * torch.pi / self.m
         self.t = self.l * torch.tan(self.theta / 2.0)
         self.f = torch.exp(-self.t ** 2) * (self.l ** 2 + self.t ** 2)  # fmt: skip
+        self.f = torch.cat([torch.zeros_like(self.f[:1]), self.f])
         self.a = torch.fft.fft(torch.fft.fftshift(self.f)).real / self.m2
         self.a = torch.flipud(self.a[1:self.n + 1])  # fmt: skip
 
     def w_algorithm(self, z: torch.Tensor) -> torch.Tensor:
-        r"""Compute the Faddeeva function of a complex number.
+        """Compute the Faddeeva function of a complex number.
 
         Args:
-            z (torch.Tensor): A tensor of complex numbers.
+            z: A tensor of complex numbers.
 
         """
         self.l = self.l.to(z.device)
@@ -69,10 +65,10 @@ class ERF1994(nn.Module):
         return 2 * p / ln_iz.pow(2) + (1.0 / torch.sqrt(torch.tensor(torch.pi))) / ln_iz
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        r"""Compute the error function of a complex number.
+        """Compute the error function of a complex number.
 
         Args:
-            z (torch.Tensor): A tensor of complex numbers.
+            z: A tensor of complex numbers.
 
         """
         sign_r = torch.sign(z.real)
@@ -83,16 +79,17 @@ class ERF1994(nn.Module):
 
 
 class TRAC(BaseOptimizer):
-    """A Parameter-Free Optimizer for Lifelong Reinforcement Learning.
+    """Optimizer wrapper with parameter free scale adaptation.
 
     Args:
-        optimizer (OptimizerInstanceOrClass): Base optimizer.
-        betas (List[float]): List of beta values.
-        num_coefs (int): Number of polynomial coefficients to use in the approximation.
-        s_prev (float): Initial scale value.
-        eps (float): Term added to the denominator to improve numerical stability.
+        optimizer: Base optimizer.
+        betas: Decay rates for the online learners whose scale estimates are combined.
+        num_coefs: Number of polynomial coefficients to use in the approximation.
+        s_prev: Initial scale value.
+        eps: Term added to the denominator to improve numerical stability.
 
-    Example:
+    Examples:
+        ```python
         model = YourModel()
         optimizer = TRAC(AdamW(model.parameters()))
 
@@ -101,13 +98,14 @@ class TRAC(BaseOptimizer):
             loss = loss_fn(model(input), output)
             loss.backward()
             optimizer.step()
+        ```
 
     """
 
     def __init__(
         self,
         optimizer: OptimizerInstanceOrClass,
-        betas: List[float] = (0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999),
+        betas: Sequence[float] = (0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999),
         num_coefs: int = 128,
         s_prev: float = 1e-8,
         eps: float = 1e-8,
@@ -117,8 +115,9 @@ class TRAC(BaseOptimizer):
         self.validate_non_negative(s_prev, 's_prev')
         self.validate_non_negative(eps, 'eps')
 
-        self._optimizer_step_pre_hooks: Dict[int, Callable] = {}
-        self._optimizer_step_post_hooks: Dict[int, Callable] = {}
+        self._optimizer_step_pre_hooks: dict[int, Callable] = OrderedDict()
+        self._optimizer_step_post_hooks: dict[int, Callable] = OrderedDict()
+        self._patch_step_function()
 
         self.optimizer: Optimizer = self.load_optimizer(optimizer, **kwargs)
 
@@ -143,16 +142,52 @@ class TRAC(BaseOptimizer):
         return self.optimizer.state
 
     def state_dict(self) -> State:
-        return self.optimizer.state_dict()
+        state_dict = self.optimizer.state_dict()
+        if 'trac' in state_dict['state']:
+            parameter_indices = {
+                p: index
+                for group, saved_group in zip(self.param_groups, state_dict['param_groups'])
+                for p, index in zip(group['params'], saved_group['params'])
+            }
+            state_dict['state']['trac'] = {
+                parameter_indices.get(key, key): value for key, value in state_dict['state']['trac'].items()
+            }
+        return state_dict
 
     def load_state_dict(self, state_dict: State) -> None:
+        saved_trac = state_dict['state'].get('trac')
+        if saved_trac is not None:
+            parameters = [p for group in self.param_groups for p in group['params']]
+            references = [value for key, value in saved_trac.items() if isinstance(key, torch.Tensor)]
+            if not references:
+                references = [
+                    saved_trac.get(index) for group in state_dict['param_groups'] for index in group['params']
+                ]
+
+            metadata = {key: value for key, value in saved_trac.items() if isinstance(key, str)}
+            if (
+                len(references) != len(parameters)
+                or len(saved_trac) != len(metadata) + len(parameters)
+                or any(
+                    not isinstance(ref, torch.Tensor) or ref.shape != p.shape for p, ref in zip(parameters, references)
+                )
+            ):
+                raise ValueError('TRAC state does not match the current parameters')
+
+            trac_state = {
+                key: value.to(device=parameters[0].device) if isinstance(value, torch.Tensor) else value
+                for key, value in metadata.items()
+            }
+            trac_state.update({p: ref.to(p) for p, ref in zip(parameters, references)})
+            state_dict = {**state_dict, 'state': {**state_dict['state'], 'trac': trac_state}}
+
         self.optimizer.load_state_dict(state_dict)
 
     def init_group(self, group: ParamGroup, **kwargs) -> None:
         if 'step' not in group:
             group['step'] = 0
 
-        updates: Dict[torch.Tensor, torch.Tensor] = kwargs.get('updates', {})
+        updates: dict[torch.Tensor, torch.Tensor] = kwargs.get('updates', {})
 
         for p in group['params']:
             self.state['trac'][p] = updates[p].clone()
@@ -171,7 +206,7 @@ class TRAC(BaseOptimizer):
         return self.erf(ix).imag
 
     @torch.no_grad()
-    def backup_params_and_grads(self) -> Tuple[Dict, Dict]:
+    def backup_params_and_grads(self) -> tuple[dict, dict]:
         updates, grads = {}, {}
 
         for group in self.param_groups:
@@ -182,15 +217,14 @@ class TRAC(BaseOptimizer):
         return updates, grads
 
     @torch.no_grad()
-    def trac_step(self, updates: Dict, grads: Dict) -> None:
+    def trac_step(self, updates: dict, grads: dict) -> None:
         self.state['trac']['step'] += 1
 
         deltas = {}
 
-        device = self.param_groups[0]['params'][0].device
-
         s = self.state['trac']['s']
-        h = torch.zeros((1,), device=device)
+        h = torch.zeros((1,), device=s.device)
+
         for group in self.param_groups:
             for p in group['params']:
                 if grads[p] is None:
@@ -232,14 +266,28 @@ class TRAC(BaseOptimizer):
 
     @torch.no_grad()
     def step(self, closure: Closure = None) -> Loss:
-        # TODO(kozistr): backup is first to get the delta of param and grad, but it does not work.
-        with torch.enable_grad():
-            loss = self.optimizer.step(closure)
-
         updates, grads = self.backup_params_and_grads()
 
+        if closure is not None:
+
+            def trac_closure():
+                with torch.enable_grad():
+                    loss = closure()
+
+                for p in grads:
+                    grads[p] = p.grad.clone() if p.grad is not None else None
+
+                return loss
+
+            loss = self.optimizer.step(trac_closure)
+        else:
+            loss = self.optimizer.step()
+
+        if not updates:
+            return loss
+
         if 'trac' not in self.state:
-            device = self.param_groups[0]['params'][0].device
+            device = next(iter(updates)).device
 
             self.state['trac'] = {
                 'betas': torch.tensor(self.betas, device=device),
