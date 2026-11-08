@@ -328,6 +328,7 @@ OPTIMIZER_RECIPES: list[tuple[str, dict[str, Any], int]] = [
     ('dualadam', {'lr': 1e0, 'weight_decay': 1e-3, 'weight_decouple': True, 'switch_rate': 0.5}, 5),
     ('lorarite', {'lr': 5e-1, 'weight_decay': 1e-3, 'weight_decouple': True, 'update_capping': 0.1}, 5),
     ('flashadamw', {'lr': 5e-1, 'weight_decay': 1e-3, 'check_numerics': True, 'master_weight_bits': None}, 5),
+    ('sage', {'lr': 5e-1, 'weight_decay': 1e-3}, 5),
 ]
 
 BASELINE_OPTIMIZER_RECIPES = list({recipe[0]: recipe for recipe in reversed(OPTIMIZER_RECIPES)}.values())
