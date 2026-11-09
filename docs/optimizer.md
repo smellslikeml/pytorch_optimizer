@@ -460,6 +460,10 @@
     :docstring:
     :members:
 
+::: pytorch_optimizer.SAGE
+    :docstring:
+    :members:
+
 ::: pytorch_optimizer.SAM
     :docstring:
     :members:

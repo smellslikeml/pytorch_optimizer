@@ -103,6 +103,7 @@ from pytorch_optimizer.optimizer.ranger import Ranger
 from pytorch_optimizer.optimizer.ranger21 import Ranger21
 from pytorch_optimizer.optimizer.rose import ROSE
 from pytorch_optimizer.optimizer.rotograd import RotoGrad
+from pytorch_optimizer.optimizer.sage import SAGE
 from pytorch_optimizer.optimizer.sam import BSAM, GSAM, SAM, WSAM, FriendlySAM, LookSAM
 from pytorch_optimizer.optimizer.sara import SaRA
 from pytorch_optimizer.optimizer.schedulefree import (
@@ -151,6 +152,7 @@ __all__ = [
     'QHM',
     'RACS',
     'ROSE',
+    'SAGE',
     'SAM',
     'SCION',
     'SGD',
@@ -391,6 +393,7 @@ OPTIMIZER_LIST: list[OptimizerType] = [
     Ranger,
     Ranger21,
     ROSE,
+    SAGE,
     SCION,
     SCIONLight,
     SGDP,
